@@ -1,0 +1,11 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Local cache produced by call.py / login.py at runtime
+tmp/
+
+# Local credential / token files (these live in ~/.config/graft-comboagent/, but be safe)
+token.json
+*.token
