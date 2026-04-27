@@ -117,12 +117,19 @@ code_search(mode="ast", pattern="class $NAME extends <BaseClass>", language="jav
 
 ### Step 4: LTM 交叉验证
 
+**两路并查**——bug 模式和误报标记走不同存储池：
+
 ```
+# ① Bug 模式池（与 bug-import 加工器同池，干净不含系统/工具运行时错误）
+unified_search(action="search", sources=["fact"], tags_include=["bug_pattern"], query="<当前变更相关模式>")
+
+# ② 误报/漏报反馈池（沿用 error_pattern；同时也会捞到平台/工具反馈，由 query 文本和 tags 区分）
 unified_search(action="search", memory_type="error_pattern", query="<当前变更相关模式>")
 ```
 
-- 检查本次变更是否命中历史 Bug 模式 → 提升置信度
-- 检查是否与历史误报相似 → 降低置信度或过滤
+- 通路 ① 命中历史 Bug 模式 → 提升置信度（这是项目级长期统计 + 实时学习的合并视角）
+- 通路 ② 命中历史误报反馈 → 降低置信度或过滤
+- **不要**直接用 `memory_type="error_pattern"` 检索"代码 Bug 模式"——那会把平台运行时错误一并捞回
 
 ### Step 5: 生成报告
 
@@ -182,18 +189,55 @@ HTML 报告必须包含：
 
 > **注意**：不需要用户额外触发"生成报告"——这是审核流程的自然输出。
 
-### Step 6: 知识沉淀
+### Step 6: 知识沉淀（**两路写入，互不污染**）
 
-新发现的 Bug 模式写入 LTM，下次审核 Step 4 自动命中：
+#### 6a. 新发现的 Bug 模式 → `fact` + `tags=["bug_pattern", ...]`
+
+与 [`bug-import`](../bug-import/SKILL.md) 加工器**同池**，不进 `error_pattern` 池（避免与系统/工具运行时错误混杂）：
 
 ```
 record_knowledge(
-    knowledge_units='[{"knowledge_unit": "<Bug 模式描述>", "chunk_ids": [], "tags": ["<关键词>"], "tool": "agent"}]',
+    knowledge_units='[{
+        "knowledge_unit": "<Bug 模式描述，例如：心跳超时必须触发断连>",
+        "tags": ["bug_pattern", "module:<模块名>", "pattern:<模式关键词>", "source:agent_realtime"],
+        "key": "bug_pattern:<模块>:<模式键>",
+        "confidence": 0.7
+    }]',
+    memory_type="fact"
+)
+```
+
+要点：
+- `tags` 必须包含 `"bug_pattern"` —— 这是与 `bug-import` 共享的检索 anchor
+- `tags` 建议加 `"source:agent_realtime"` 与 bug-import 加工器（`extraction_type=*_hotspot`）区分来源
+- `key` 建议拼为 `bug_pattern:<模块>:<模式键>`，同 user 同 key 自动覆盖更新
+
+#### 6b. 误报 / 漏报反馈 → 仍走 `error_pattern`
+
+误报/漏报本质是"审核反馈"，与 `memory-sdk` 的工具失败反馈语义一致，继续用 `error_pattern`：
+
+```
+record_knowledge(
+    knowledge_units='[{
+        "knowledge_unit": "<反馈说明，例如：WebSocketServer.onClose 中的空 catch 是故意吞异常，不是 Bug>",
+        "tags": ["false_positive", "<module>", "<context>"]
+    }]',
     memory_type="error_pattern"
 )
 ```
 
-如果用户反馈某 finding 是误报/漏报，同样用 `error_pattern` 模式记录，tags 加 `"false_positive"` 或 `"missed_issue"`。
+`tags` 用 `"false_positive"`（误报）或 `"missed_issue"`（漏报）标记反馈类型。
+
+#### 为什么这样分流
+
+| 写入 | memory_type | tags anchor | 同池伙伴 |
+|---|---|---|---|
+| Bug 模式（命中型）| `fact` | `bug_pattern` | `bug-import` Phase 3 加工出的项目级 fact |
+| 误报/漏报反馈 | `error_pattern` | `false_positive` / `missed_issue` | `memory-sdk` 工具失败反馈 |
+
+Step 4 检索时**两池都查**，分别用 `sources=["fact"], tags_include=["bug_pattern"]` 和 `memory_type="error_pattern"` —— 互不污染。
+
+---
 
 如果 `callback` 配置了仓库回写，通知用户需要手动调用仓库集成 Skill 回写评论。
 
