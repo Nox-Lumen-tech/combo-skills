@@ -14,12 +14,6 @@ See the [docs · Skills](https://xipnex.nox-lumen.com/docs/skills) for the full 
 | [docx](./docx/) | Create, read, edit, and manipulate Word documents (.docx) with full formatting support |
 | [xlsx](./xlsx/) | Create, read, edit, and manipulate Excel spreadsheets (.xlsx/.xls) |
 
-### Industry knowledge
-
-| Skill | Description |
-|-------|-------------|
-| [eea-gac-cross-reference](./eea-gac-cross-reference/) | Cross-reference EEA / GAC ASPICE artifacts (requirements ↔ design ↔ test) |
-
 ### Code review — L2 (semantic, LLM-driven)
 
 [Overview](https://xipnex.nox-lumen.com/docs/skills/code-review)
@@ -69,6 +63,8 @@ For example:
 /skill-install Nox-Lumen-tech/combo-skills/checkstyle
 /skill-install Nox-Lumen-tech/combo-skills/clang-tidy
 /skill-install Nox-Lumen-tech/combo-skills/docx
+/skill-install Nox-Lumen-tech/combo-skills/document-editing
+/skill-install Nox-Lumen-tech/combo-skills/xlsx
 ```
 
 > The full **L1 + L2 review suite** is just 11 `/skill-install` commands away.
