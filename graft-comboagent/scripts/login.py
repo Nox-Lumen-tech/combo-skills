@@ -54,9 +54,9 @@ TOKEN_PATH = Path(
     )
 )
 
-# 默认服务器 URL（开发环境）。用户回车即用；--server 或 GRAFT_COMBOAGENT_SERVER 可覆盖。
-# 生产上线后把此值换成 prod URL 再发布即可。
-DEFAULT_SERVER = "http://ec2-43-203-183-212.ap-northeast-2.compute.amazonaws.com:9222"
+# 默认服务器 URL（生产）。用户回车即用此值；
+# 自有部署 / 内网 / dev 环境用 --server 或 GRAFT_COMBOAGENT_SERVER 覆盖。
+DEFAULT_SERVER = "https://xipnex.nox-lumen.com"
 
 
 def _normalize_server(url: str) -> str:
