@@ -1,0 +1,43 @@
+{
+  "bugs": [
+    {
+      "bug_id": "JIRA-1234",
+      "title": "HeartbeatChecker 未实现断连逻辑",
+      "severity": "critical",
+      "status": "resolved",
+      "module": "CarSyncShare",
+      "affected_files": [
+        "src/main/java/com/vehicle/sync/HeartbeatChecker.java",
+        "src/main/java/com/vehicle/sync/ConnectionManager.java"
+      ],
+      "language": "java",
+      "root_cause": "missCount 达到阈值后未调用 disconnectClient()，导致僵尸连接堆积",
+      "fix_description": "在 checkHeartbeat() 中增加 if(missCount >= threshold) disconnectClient(clientId)",
+      "pattern_tags": ["timeout", "resource_leak", "missing_disconnect"],
+      "reporter": "张三",
+      "assignee": "李四",
+      "project": "vehicle-connectivity",
+      "created_at": "2025-03-15",
+      "resolved_at": "2025-03-20",
+      "description": "测试环境复现：保持 10 个客户端连接，WiFi 断开后，服务端 30 分钟内未释放连接资源。",
+      "url": "https://jira.example.com/browse/JIRA-1234"
+    },
+    {
+      "bug_id": "JIRA-1235",
+      "title": "登录页面未校验空密码",
+      "severity": "major",
+      "status": "closed",
+      "module": "auth-service",
+      "affected_files": [
+        "src/main/java/com/auth/LoginController.java"
+      ],
+      "language": "java",
+      "root_cause": "前端校验存在但后端缺少 @NotBlank 注解，空密码绕过前端直接调 API 可登录",
+      "fix_description": "后端 LoginRequest DTO 增加 @NotBlank(message=\"密码不能为空\") 校验",
+      "pattern_tags": ["input_validation", "null_check", "security"],
+      "project": "vehicle-connectivity",
+      "created_at": "2025-04-01",
+      "resolved_at": "2025-04-03"
+    }
+  ]
+}

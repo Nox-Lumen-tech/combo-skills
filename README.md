@@ -22,6 +22,14 @@ See the [docs · Skills](https://xipnex.nox-lumen.com/docs/skills) for the full 
 |-------|-------------|
 | [code-review](./code-review/) | Enterprise L2 review. Cross-checks code against requirements / design docs / coding standards / bug history. Produces structured reports across 8 categories × 3 severities |
 
+### Code review — bug history feed
+
+Feeds the L2 reviewer with cross-bug pattern facts so it can match `bug_pattern_match` instead of just keyword-searching individual tickets.
+
+| Skill | Description |
+|-------|-------------|
+| [bug-import](./bug-import/) | Import historical defects (Jira / Redmine / TAPD / CSV / JSON), validate, write to KB, and let the LTM cron distill cross-bug pattern `fact`s for the L2 reviewer to consume |
+
 ### Code review — L1 (static analysis, deterministic)
 
 L1 skills run upstream tools and emit a unified `CodeEvidence` JSON consumed by [code-review](./code-review/).
@@ -59,6 +67,7 @@ For example:
 
 ```
 /skill-install Nox-Lumen-tech/combo-skills/code-review
+/skill-install Nox-Lumen-tech/combo-skills/bug-import
 /skill-install Nox-Lumen-tech/combo-skills/ruff
 /skill-install Nox-Lumen-tech/combo-skills/checkstyle
 /skill-install Nox-Lumen-tech/combo-skills/clang-tidy
