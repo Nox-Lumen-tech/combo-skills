@@ -31,18 +31,22 @@ metadata:
 
 **默认** `https://xipnex.nox-lumen.com`（公有云）。自部署 / 内网 / 临时 cloudflare tunnel 用 `python scripts/login.py --server <URL>` 或 `GRAFT_COMBOAGENT_SERVER=<URL>` 覆盖一次即可——server 会和 token 一起持久化到 `~/.config/graft-comboagent/token.json`，之后所有 `call.py` 自动指向它。
 
+**官方获取入口**：用户在 [`https://xipnex.nox-lumen.com/combospace/user-setting/skills`](https://xipnex.nox-lumen.com/combospace/user-setting/skills) 可以查看/复制属于自己的 combo-agent 访问地址。如果用户没明确说用哪个 server，agent 应先建议他从这里复制。
+
 **用户丢一条完整 signin URL 时，agent 自己拆**：例如
-`https://katrina-simpson-welfare-funeral.trycloudflare.com/zh/signin?email=test-syncore%40nox-lumen.com&password=syncore`
+`https://katrina-simpson-welfare-funeral.trycloudflare.com/zh/signin?email=test-syncore%40nox-lumen.com&password=<password>`
 应拆成：
 - `--server https://katrina-simpson-welfare-funeral.trycloudflare.com`（去掉 `/zh/signin` path 和整个 query）
 - `--email test-syncore@nox-lumen.com`（URL-decode：`%40`→`@`、`%20`→空格 等）
-- `--password syncore`
+- `--password <password>`（从 query 原值取，URL-decode 后用）
 
 然后一行直接登录（无需交互）：
 
 ```bash
 python scripts/login.py --server <URL> --email <email> --password <pwd>
 ```
+
+**链接里没带 email/password 时，HIL 问用户，不要瞎猜**：如果用户给的 URL 是 `https://xipnex.nox-lumen.com/combospace/user-setting/skills` 这种**纯页面链接**（没有 query string，或 query 里只有 server 信息），agent 只能拆出 server，**email 和 password 必须停下来问用户索要**——不要拿历史对话、配置文件、环境变量里的别人账号去登。
 
 ### A. KB 检索（最常用，先看这里）
 
