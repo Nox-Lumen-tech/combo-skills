@@ -51,7 +51,7 @@ L1 skills run upstream tools and emit a unified `CodeEvidence` JSON consumed by 
 
 | Skill | Description |
 |-------|-------------|
-| [graft-comboagent](./graft-comboagent/) | **Local IDE → Combo Agent cloud bridge.** Lets Cursor / Claude Code / Codex / Trae fetch session digests, rounds, and files from your Combo Agent tenant over HTTPS |
+| [graft-comboagent](./graft-comboagent/) | **Local IDE → Combo Agent cloud bridge.** Lets Cursor / Claude Code / Codex / Trae do three things over HTTPS against your Combo Agent tenant: (A) **search cloud KBs** as a RAG source for the local agent, (B) **graft existing session artifacts** (digests / rounds / files) into local context, (C) **dispatch tasks** back to a long-running cloud session for async execution |
 
 ## Installation
 
