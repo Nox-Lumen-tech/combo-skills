@@ -40,20 +40,48 @@ error_categories:
 
 ## 六步审核流程
 
-### Step 1: 代码变更获取
+### Step 1: 代码获取（diff 或全量）
 
-根据输入来源获取 diff：
+根据输入来源选择获取方式。**三种场景**，输入字段决定走哪条路：
 
-**场景 A — CI/CD 触发（repo_source）：**
+| 场景 | 触发条件 | 模式 |
+|---|---|---|
+| A | `repo_source` 含 `change_id`/`mr_iid`/`pr_number` | **变更审**（diff） |
+| B | `task_params.code_evidence` 非空 | **变更审**（L1 上传） |
+| C | `repo_source` 仅含 `branch`（无 change/mr/pr 标识） | **全分支审**（整树通读） |
+
+**场景 A — CI/CD 触发的变更审（repo_source.change_id 等）：**
 使用仓库集成 Skill 的 tool 拉取 diff：
 - Gerrit（默认主力）：`gerrit_get_diff(change_id="…")` — `change_id` 用会话里 `scm_tool_context.change_id`（triplet 或数字），勿手写错
+- GitHub: `github_get_pr_diff(owner="...", repo="...", pull_number=123)`
 - GitLab: `gitlab_get_mr_diff(mr_iid="78")`
 - Gitee: `gitee_get_pr_diff(owner="...", repo="...", pr_number="99")`
 
 **场景 B — L1 上传（code_evidence）：**
 直接从 `task_params.code_evidence` 中读取 L1 输出的 CodeEvidence JSON。
+- L1 默认 `git diff` 模式产物 → 走变更审
+- L1 `--all` 全量产物（CodeEvidence 含全仓 finding） → 走全量审，跳过 Step 1 远端拉取
 
-拿到 diff 后，识别变更文件列表、语言分布、关键变更函数。
+**场景 C — 全分支审（repo_source.branch，无 change/mr/pr）：**
+
+适用：客户给定一个新分支要求"从头全面审"，没有 PR/MR/change，例如新人交付分支的入会评审。
+
+按平台用对应"列树 + 读文件"的工具对替代 diff：
+
+| 平台 | 列文件树 | 读单文件 | 备注 |
+|---|---|---|---|
+| GitHub | `github_get_tree(owner, repo, ref=branch, recursive=True)` | `github_get_file_contents(owner, repo, path, ref=branch)` | git/trees API |
+| GitLab | `gitlab_get_tree(project_id, ref=branch, recursive=True)` | `gitlab_get_file_contents(project_id, path, ref=branch)` | repository/tree API |
+| Gitee | `gitee_get_tree(owner, repo, ref=branch, recursive=True)` | `gitee_get_file_contents(owner, repo, path, ref=branch)` | git/trees API（GitHub 兼容；ref 留空自动解析 default_branch） |
+| **Gerrit** | ❌ **不支持** | — | core REST 不暴露 git tree（已在 v3.14 文档及 gerrithub.io / googlesource / opendev 三家公网验证）。需要全分支审请改用上面三家，或在 sandbox 里 `git clone https://<gerrit-host>/<project>` 后走文件系统路径。 |
+
+执行规则：
+1. 先 `_get_tree` 拉全分支文件清单。若返回 `truncated=true`，按子目录用 `path` 参数分批降级。
+2. 按文件类型/扩展名/规模分组，**优先读源码主目录**（如 `src/`、`app/`），跳过 `node_modules`、`vendor`、`dist`、二进制资源。
+3. 对每个被选中的文件用 `_get_file_contents` 读全文落入工作上下文。
+4. **建议先跑 L1 全量**：本地有同分支 checkout 时，让用户/上游先跑 `bash scripts/code-review.sh --all --output evidence.json` 把工具客观检测产物作为 `code_evidence` 一起注入，避免 L2 重复发现 L1 覆盖的规则类问题。
+
+拿到代码后（场景 A/B 是 diff + 上下文，场景 C 是整树文件全文），识别文件列表、语言分布、关键模块/函数。后续 Step 2~6 共用同一流程；只在 Step 3 维度审核里做差异化（场景 C 不做"diff vs 需求"对比，改为"代码实现 vs 需求"通查）。
 
 ### Step 2: 需求基线检索
 
@@ -84,16 +112,16 @@ code_search(mode="ast", pattern="class $NAME extends <BaseClass>", language="jav
 
 ### Step 3: 逐维度审核
 
-对 `review_config.review_dimensions` 中的每个维度，逐一对比代码变更与 KB 知识：
+对 `review_config.review_dimensions` 中的每个维度，逐一对比代码与 KB 知识。**diff 模式 vs 全量模式（场景 C）走法不同**：
 
-| 维度 | 对比方法 |
-|---|---|
-| `requirement_alignment` | KB 需求文档（Step 2 结果） vs 代码 diff |
-| `design_consistency` | `unified_search(query="架构设计 <模块名>")` vs 代码结构 |
-| `code_standard` | L1 findings 已覆盖，补充 LLM 发现的深层逻辑问题 |
-| `security` | 业务逻辑层面：鉴权遗漏、敏感数据暴露、权限绕过 |
-| `performance` | 业务场景：N+1 查询、大循环内 IO、并发安全 |
-| `bug_fix_validation` | `unified_search(query="BUG-1234")` vs 代码修复 |
+| 维度 | diff 模式（场景 A/B） | 全量模式（场景 C） |
+|---|---|---|
+| `requirement_alignment` | KB 需求文档 vs 代码 diff | KB 需求文档 vs **整分支代码实现**；按需求条目反向定位代码（覆盖率统计才有意义） |
+| `design_consistency` | 改动是否破坏架构 | 整分支结构是否符合架构设计 |
+| `code_standard` | L1 findings 已覆盖，补充 diff 范围内深层逻辑问题 | L1 `--all` findings 已覆盖，补充全仓深层逻辑问题 |
+| `security` | 业务逻辑层面：鉴权遗漏、敏感数据暴露、权限绕过（diff 范围） | 同上，扩展到全分支 |
+| `performance` | diff 引入的 N+1、大循环 IO、并发问题 | 整分支热点路径排查 |
+| `bug_fix_validation` | 仅 diff 模式有效（`unified_search(query="BUG-1234")` vs 代码修复） | 跳过（全分支审无修复目标） |
 
 每个 L2 Finding 必须包含：
 
