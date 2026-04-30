@@ -15,9 +15,23 @@ description: >-
 
 > 历史名称为 `code-review-local`，已重命名为 `static-analysis` 以更准确反映"跑工具检测"的职责，与 LLM 深度审核 skill `code-review` 区分。
 
+## 首次使用（必读）
+
+本 skill **不打包**静态分析工具二进制（checkstyle / pmd / spotbugs / detekt / ruff / bandit / semgrep / cppcheck / clang-tidy）。首次使用前先一键安装：
+
+```bash
+# 一键安装全部工具（写到 ~/.review-tools/，不污染系统）
+bash scripts/install-review-tools.sh --all
+
+# 或按阶段装（Phase 1: Java + Python + Semgrep；Phase 2: + Kotlin/仓库集成）
+bash scripts/install-review-tools.sh --phase 1
+```
+
+工具不装的语言会**自动跳过**（不报错），所以可以只装关心的语言。
+
 ## 核心入口
 
-项目内置编排脚本 `scripts/code-review.sh`，它是所有静态分析工具的统一调度器：
+本 skill 内置编排脚本 `scripts/code-review.sh`（和 `scripts/install-review-tools.sh` 一起随 skill 分发），它是所有静态分析工具的统一调度器：
 
 ```bash
 # 审核 git diff 变更文件
