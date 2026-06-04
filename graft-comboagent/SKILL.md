@@ -10,16 +10,17 @@ metadata:
 
 # Graft-Comboagent — ragbase 远程客户端
 
-本地 agent（Cursor / Claude Code / Codex）通过本 skill 直连云端 ragbase，做三件事：
+本地 agent（Cursor / Claude Code / Codex）通过本 skill 直连云端 ragbase，做四件事：
 
 | 用途 | 说明 | 写入云端？ | 是否需要云端先跑过 session |
 |---|---|---|---|
 | **A. KB 检索**（核心高频） | 列我有哪些 KB → 在 KB 里做语义检索 → 把命中 chunks 拉回本地给当前 agent 当 RAG 上下文 | 否 | 不需要 |
 | **B. Session 嫁接** | 拉某次 comboagent 跑出来的 digest / round / 产出物，对照本地代码做分析 | 否 | 需要 |
 | **C. 派发任务** | 把指令派给已存在的某个 session，让云端 agent 排队跑一轮（异步） | 触发执行（不创建/删除资源） | 需要（目标 session 必须已存在） |
+| **D. 上传到 KB**（`upload`） | 把本地文件灌进**指定 KB**，可选触发解析；本地的 findings / 缺陷 / 报告回流云端 KB | **是**（入库；仅限你有权限的 KB） | 不需要 |
 
-> 服务端实现在 `AgentFlow/src/skills/builtin/graft` 与 `api/apps/graft_app.py` / `api/apps/kb_app.py`。
-> 本 skill 是这些 HTTP 端点的本地包装。**写边界很窄**：除 `dispatch_task` 外，所有命令均为只读。
+> 服务端实现在 `AgentFlow/src/skills/builtin/graft` 与 `api/apps/graft_app.py` / `api/apps/kb_app.py`；`upload` 直接复用平台现成的 `/v1/document/upload`（+ 可选 `/v1/document/run`），与云端 agent 的 `kb_upload` / `kb_parse` 同源。
+> 本 skill 是这些 HTTP 端点的本地包装。**写边界很窄**：只有 `dispatch_task` 和 `upload` 两个写动作，其余全部只读。
 
 > 🌳 **不知道用哪条 action？先查 [`references/action-decision-tree.md`](references/action-decision-tree.md)** —— 按"用户意图"分类的 9 分支决策树，本地 LLM 1 秒选中。
 
@@ -111,7 +112,32 @@ python scripts/login.py --server <URL> --email <email> --password <pwd>
 
 典型用途：本地 agent 决定"这个 KB 检索结果不够，要让云端某个长跑 session 重新跑一轮带上新指令" → 派任务回去 → 用 `get_digest` 看新一轮产出。
 
-### D. search 高级过滤（小众但 unified_search 支持）
+### D. 上传本地文件到 KB（upload — 第二个、也是唯一的"入库"写口）
+
+把本地文件灌进**指定 KB**。典型场景：本地 agent 跑出 findings / 缺陷分析 / 报告，要回流到云端某个 KB，供后续 comboagent / 团队检索。
+
+| 操作 | 命令 |
+|---|---|
+| 先找目标 KB 的 kb_id | `python scripts/call.py list_kbs [--keywords <名字>]` |
+| **上传单个文件**（默认只上传不解析） | `python scripts/call.py upload --kb-id <kb_id> --file ./缺陷分析.md` |
+| 上传并立即解析入库 | `python scripts/call.py upload --kb-id <kb_id> --file ./report.docx --parse` |
+| 上传多个文件 | `python scripts/call.py upload --kb-id <kb_id> --file a.md --file b.xlsx --parse` |
+| 上传整个目录（按模式） | `python scripts/call.py upload --kb-id <kb_id> --dir ./findings --glob "*.md" --parse` |
+| 指定 parser / KB 子目录 / 改名 | `... --parser-id naive --kb-path findings/2026 --name 缺陷汇总.md` |
+| 看解析进度 | `python scripts/call.py list_documents --kb-ids <kb_id>` 看每条 `run` / `progress` |
+
+**关键约定**：
+- **默认只上传不解析**。要让文件真正进检索（chunk + embedding），必须加 `--parse`（或事后在前端 KB 页点解析）。这是刻意的：避免误触发大批量解析占用云端队列。
+- **并发上传**（默认 8 路，`--workers N` 调整，`--workers 1` 退回顺序）。每个请求仍是单文件，`doc_id` 与本地文件保持 1:1 对齐。整目录/几十个文件直接 `--dir` 即可；上千文件的大批量仍建议走前端 KB 或云端 Source SKILL。
+- 单文件 ≤ 200 MB；超限请走前端 KB。
+- 上传后本地会把 `content_hash(sha256) → local_path` 追加到 `.graft/uploads/manifest.jsonl`（可用 `--no-manifest` 关）。这是 M4 架构边界：**云端只拿文件字节，不持有任何指向你本地的路径**；本地自己存映射，便于召回云端 chunk 时跳回本地原文。
+- 只能上传到**你有权限的 KB**（服务端 `upload()` 用 `current_user` 校验 KB 归属；kb_id 不存在/无权限会被拒，本地不创建任何东西）。
+
+返回 JSON 关键字段：`uploaded[].doc_id` / `uploaded[].sha256` / `parse_triggered` / `manifest`（本地清单路径）/ `failed[]`（逐文件失败原因）。
+
+⚠️ **依赖后端可达**：`upload` 命中的是 ragbase 主服务的 `/v1/document/upload`，和 `list_kbs` 同一个 server；如果 `list_kbs` 能通，`upload` 就能通。
+
+### E. search 高级过滤（小众但 unified_search 支持）
 
 `search` action 除了 `--query / --kb-ids / --doc-ids / --top-k / --source`，还透传：
 
@@ -123,11 +149,15 @@ python scripts/login.py --server <URL> --email <email> --password <pwd>
 
 > 这些参数和上面 A/B 节里的命令可以**任意组合**——本 skill 把所有非 dispatch / 非 KB-only 字段透传给 unified_search，用法对齐云端 agent 工具签名（详见 `AgentFlow/src/memory/memory_os.py::create_tool`）。
 
-### 严格只读边界（除 dispatch_task 外）
+### 严格只读边界（仅 dispatch_task / upload 两个写口）
 
-`call.py` 在分发前会拒绝任何 `rm` / `delete` / `remove` / `save` / `create` / `update` / `patch` / `put` 类 action，以及服务端禁用的 `copy_kb_document` / `register_artifact`。即便你的 token 在技术上能调那些端点，本 skill 也不给入口。**写/删请走前端 UI**。
+`call.py` 在分发前会拒绝任何 `rm` / `delete` / `remove` / `save` / `create` / `update` / `patch` / `put` 类 action，以及服务端禁用的 `copy_kb_document` / `register_artifact`。即便你的 token 在技术上能调那些端点，本 skill 也不给入口。**删除 / 改写 KB 已有内容请走前端 UI**。
 
-`dispatch_task` 是**唯一**的写类入口：它仅向已有 session 排队一次执行，不修改 / 创建 / 删除任何持久化资源。
+只有两个写动作放行：
+- `dispatch_task`：向**已有** session 排队一次执行，不修改 / 创建 / 删除任何持久化资源。
+- `upload`：把**本地文件**灌进**你有权限的指定 KB**（可选触发解析）。它新建 doc、不删/改 KB 既有内容；服务端用 `current_user` 校验 KB 归属。
+
+> 安全说明：`upload` 没有放宽任何服务端闸 —— graft 的 token 本来就是完整用户会话签名，技术上一直能命中 `/v1/document/upload`（和浏览器登录态等价）。本次只是在本地 skill 暴露了这个入口，并把它收窄成"只上传到指定 KB"。
 
 **`read_file` vs `download`**：
 - `read_file`：服务端 `markitdown` 把 docx/xlsx/pdf 转成 **markdown 文本** → 适合 AI 直接阅读、截取片段
@@ -241,7 +271,8 @@ dispatch 在已有 session 里**起一个新 episode**（独立的执行任务�
 - **先 Digest 后 drill down** — 不要盲搜，先看全貌再定点取回
 - 名称匹配多个 KB / session 时向用户确认，不要自行选择
 - 可见范围包括自己的资源 + 团队共享的资源（list 接口已自动合并）
-- 除 `dispatch_task` 外其余命令**只读**，不会修改云端任何数据；写操作在服务端白名单拦截
+- 除 `dispatch_task` / `upload` 外其余命令**只读**，不会修改云端任何数据；其余写操作在 skill 层 + 服务端双重拦截
+- `upload` 默认**只上传不解析**，要进检索得显式 `--parse`；只上传到你有权限的 KB，不删/改 KB 既有内容
 - 原始字节文件只走 `download`，不读进 AI 上下文
 - **不要把 `dispatch_task` 当成 fire-and-forget 的批量分发**：每次调用都消耗云端 agent 资源（CPU + LLM token）
 
@@ -268,3 +299,8 @@ dispatch 在已有 session 里**起一个新 episode**（独立的执行任务�
 | `[ERR] target session not found` | session id 写错或已被删 | `list_sessions --query` 找正确 id |
 | `[ERR] Not Found`（dispatch_task 调用） | 后端没部署 `/v1/graft/dispatch_task` 端点 | 确认目标 server 跑的是带新端点的版本；其他命令不受影响 |
 | `prompt too long: ... > 32768` | dispatch 的 prompt 超过 32 KB 上限 | 缩减 prompt 或拆成多次 dispatch |
+| `upload` 返回 `Can't find this knowledgebase!` | kb_id 写错 / 不在你可见范围 | 先 `list_kbs` 拿正确 kb_id；确认 KB 归属或共享 |
+| `upload` 全部 `failed`，error 含 `Connection refused` / `Max retries` | 后端 server 不可达（与 `list_kbs` 同一个 server） | 先 `list_kbs` 验证连通；不通就查 server URL / 重新 `login.py` |
+| `upload` 返回 ok 但 KB 里搜不到内容 | 没加 `--parse`，文件只上传未解析（无 chunks） | 加 `--parse` 重传，或前端 KB 页点解析；`list_documents --kb-ids <id>` 看 run/progress |
+| `upload --parser-id` 报 `Unknown parser_id` | parser_id 不在 KB 白名单 | 去掉 `--parser-id` 用 KB 默认；或查 `GET /v1/parser/discover` |
+| `upload` 报 `文件过大 ... > ...` | 单文件 > 200 MB | 大文件走前端 KB 上传，不走本 skill |

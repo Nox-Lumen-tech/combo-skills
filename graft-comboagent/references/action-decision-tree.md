@@ -2,7 +2,7 @@
 
 > 本地 agent 拿到任务后**先在这里查 1 秒**：你想做什么 → 该用哪个 action。
 >
-> 不要先看 SKILL.md A/B/C/D 表挨个对照——那些表是按"功能分类"组织的，回答的是"这条命令是什么"；这里是按"用户意图"组织的，回答"我现在该用哪条"。
+> 不要先看 SKILL.md A~E 表挨个对照——那些表是按"功能分类"组织的，回答的是"这条命令是什么"；这里是按"用户意图"组织的，回答"我现在该用哪条"。
 
 源头：云端 unified_search 工具 docstring 里的 9 分支（`AgentFlow/src/memory/memory_os.py::create_tool` 第 6842 行附近），本文做了本地化适配。
 
@@ -47,6 +47,19 @@
 | 等结果（轻量） | `list_sessions --query <名> ` 看 `updated_at` |
 | 等结果（重量） | `get_digest --session-id <id>` 看是否多出新 round |
 | 找 dispatch 跑出的新 round_id | `search --source round --query "<prompt 关键词>" --session-id <id>` ← 命中 chunk id 形如 `ep_<sid>_<EPISODE>_e<E>_r<R>`，**新 episode hash ≠ 原 episode** |
+
+## D. 我要把本地文件灌进云端 KB（回流 findings / 缺陷 / 报告）
+
+| 意图 | 用 |
+|---|---|
+| 不知道往哪个 KB 传 | 先 `list_kbs [--keywords <名字>]` 拿 kb_id |
+| 上传一个文件（先不解析） | `upload --kb-id <id> --file ./x.md` |
+| 上传并立即解析入库 | `upload --kb-id <id> --file ./x.md --parse` |
+| 一次传多个 / 整个目录 | `upload --kb-id <id> --file a.md --file b.md --parse` 或 `upload --kb-id <id> --dir ./out --glob "*.md" --parse` |
+| 落到 KB 子目录 / 指定 parser | `upload --kb-id <id> --file x.md --kb-path findings/2026 --parser-id naive --parse` |
+| 看上传后解析进度 | `list_documents --kb-ids <id>` 看每条 `run` / `progress` |
+
+> ⚠️ 默认**只上传不解析**，要进检索必须加 `--parse`。只能传到你有权限的 KB；不删/不改 KB 既有内容。大批量（几百文件）走前端 KB，不要用本 skill 刷。
 
 ## 跨场景的高频过滤参数
 

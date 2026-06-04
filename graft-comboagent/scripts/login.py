@@ -119,7 +119,8 @@ def main() -> None:
     try:
         resp = requests.post(
             url,
-            json={"email": args.email, "password": enc},
+            # client_type=cli: 服务端据此跳过 access_token 轮换, 不挤掉云端 web 会话
+            json={"email": args.email, "password": enc, "client_type": "cli"},
             timeout=15,
             verify=not args.insecure,
         )
