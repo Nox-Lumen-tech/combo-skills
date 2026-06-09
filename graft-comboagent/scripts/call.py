@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """graft-comboagent 统一调用入口。
 
-五种模式:
+七种模式:
     1. JSON action（list_sessions / get_digest / get_round / search / read_file ...）
        → POST /v1/graft/memory/unified_search                   [只读]
     2. download（特殊 action）
@@ -14,12 +14,16 @@
        → POST /v1/graft/dispatch_task                          [写：异步触发]
     6. upload（把本地文件灌进云端 KB，可选触发解析）
        → POST /v1/document/upload （+ 可选 POST /v1/document/run） [写：入库]
+    7. install_skill（把本地 skill 目录装进云端个人技能库）
+       → POST /v1/skills/install_bundle（zip 上传，git 可选）     [写：装技能]
 
-⚠️ 写边界很窄：本 skill 只有两个写动作 —— dispatch_task（向**已存在**的 session
-排队一次执行，不创建/删除资源）和 upload（把本地文件上传到指定 KB，可选触发解析）。
-除此之外不提供 delete / remove / save / create / update 类命令，即使后端 token
-技术上能调那些端点。upload 复用平台现成的 /v1/document/upload（@login_required，
-与云端 agent 的 kb_upload 走同一端点），云端只接受文件字节本身；本地侧把
+⚠️ 写边界很窄：本 skill 只有三个写动作 —— dispatch_task（向**已存在**的 session
+排队一次执行，不创建/删除资源）、upload（把本地文件上传到指定 KB，可选触发解析）
+和 install_skill（把本地 skill 目录打包上传到**本人**技能库）。除此之外不提供
+delete / remove / save / create / update 类命令，即使后端 token 技术上能调那些端点。
+upload 复用平台现成的 /v1/document/upload（@login_required，与云端 agent 的 kb_upload
+走同一端点）；install_skill 复用 /v1/skills/install_bundle，服务端走 Layer-8 安全校验
+后只写进 skills/users/<本人 uid>/，不碰他人/ builtin。本地侧把 upload 的
 content_hash → local_path 记到 .graft/uploads/manifest.jsonl，便于召回时跳回原文。
 
 用法示例:
@@ -43,14 +47,19 @@ content_hash → local_path 记到 .graft/uploads/manifest.jsonl，便于召回�
     call.py upload --kb-id <kb_id> --file ./缺陷分析.md
     call.py upload --kb-id <kb_id> --file a.docx --file b.xlsx --parse
     call.py upload --kb-id <kb_id> --dir ./findings --glob "*.md" --parse
+    # 安装本地 skill 目录到云端个人技能库（目录名须等于 skill 名，目录内含 SKILL.md）：
+    call.py install_skill --skill-path ./my-skill
+    call.py install_skill --skill-path ./my-skill --overwrite
 """
 import argparse
 import hashlib
+import io
 import json
 import mimetypes
 import os
 import sys
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -353,6 +362,34 @@ def _resolve_session_id(name: str, tok: dict, insecure: bool = False) -> str:
     return candidates[0]["session_id"]
 
 
+def _dispatch_to_session(session_uuid: str, prompt: str, tok: dict, insecure: bool = False) -> dict:
+    """POST /v1/graft/dispatch_task：向已有 session 排队一轮执行（异步）。
+
+    被 do_dispatch（独立派发）和 do_create_session（--first-prompt 建会话即驱动）
+    共用，保证两条路径的派发语义、错误处理完全一致。返回服务端 data dict。
+    """
+    body = {"target_session_id": session_uuid, "prompt": prompt, "wait": False}
+    try:
+        resp = requests.post(
+            f"{tok['server']}/v1/graft/dispatch_task",
+            json=body,
+            headers={"Authorization": tok["auth_token"]},
+            timeout=60,
+            verify=not insecure,
+        )
+    except requests.exceptions.RequestException as e:
+        sys.exit(f"[ERR] dispatch 请求失败: {e}")
+    if resp.status_code == 401:
+        sys.exit("[ERR] 认证失效，请重新运行: python scripts/login.py")
+    try:
+        data = resp.json()
+    except Exception:
+        sys.exit(f"[ERR] 非 JSON 响应: HTTP {resp.status_code} {resp.text[:300]}")
+    if data.get("code") != 0:
+        sys.exit(f"[ERR] {data.get('message', data)}")
+    return data.get("data") or {}
+
+
 def do_dispatch(args, tok: dict) -> None:
     """派发任务到已有 session（异步）。
 
@@ -374,35 +411,9 @@ def do_dispatch(args, tok: dict) -> None:
         # 解析过名字才提示，避免直接传 UUID 时多余刷屏
         print(f"[INFO] resolved '{args.session_id}' → {target_uuid}", file=sys.stderr)
 
-    body = {
-        "target_session_id": target_uuid,
-        "prompt": args.prompt,
-        # HTTP 端点服务端会强制 wait=False（没有 source session 可挂起），
-        # 这里也明确传 False，避免误以为派发后会同步等。
-        "wait": False,
-    }
-
-    try:
-        resp = requests.post(
-            f"{tok['server']}/v1/graft/dispatch_task",
-            json=body,
-            headers={"Authorization": tok["auth_token"]},
-            timeout=60,
-            verify=not args.insecure,
-        )
-    except requests.exceptions.RequestException as e:
-        sys.exit(f"[ERR] 请求失败: {e}")
-
-    if resp.status_code == 401:
-        sys.exit("[ERR] 认证失效，请重新运行: python scripts/login.py")
-    try:
-        data = resp.json()
-    except Exception:
-        sys.exit(f"[ERR] 非 JSON 响应: HTTP {resp.status_code} {resp.text[:300]}")
-    if data.get("code") != 0:
-        sys.exit(f"[ERR] {data.get('message', data)}")
-
-    payload = data.get("data") or {}
+    payload = _dispatch_to_session(
+        target_uuid, args.prompt, tok, insecure=args.insecure
+    )
     out = {
         "ok": True,
         "queued": True,
@@ -410,8 +421,8 @@ def do_dispatch(args, tok: dict) -> None:
         "agent_id": payload.get("agent_id"),
         "queued_at_ms": payload.get("queued_at_ms"),
         "hint": (
-            "用 get_round --session-id <target_session_id> --round-id -1 "
-            "轮询新一轮进度（latest）。"
+            "用 get_digest --session-id <target_session_id> 看新一轮概览"
+            "（服务端 get_round 需具体 round 号，不支持 -1）。"
         ),
     }
     indent = None if args.raw else 2
@@ -663,6 +674,290 @@ def do_upload(args, tok: dict) -> None:
     print(json.dumps(out, ensure_ascii=False, indent=indent))
 
 
+# 打包 skill 目录时跳过的目录（graft 是独立 requests 客户端，不 import ragbase，
+# 这里维护一份与后端 SKIP_DIRS 等价的客户端副本）。
+_SKILL_SKIP_DIRS = frozenset({
+    ".git", "__pycache__", "node_modules", ".venv", "venv",
+    ".pytest_cache", ".mypy_cache", ".idea", ".vscode",
+})
+
+
+def do_install_skill(args, tok: dict) -> None:
+    """把本地 skill 目录打包成 zip 上传到云端**个人**技能库（写）。
+
+    复用后端 /v1/skills/install_bundle：服务端解压 → Layer-8 SkillSafetyValidator
+    校验 → 只写进 skills/users/<本人 uid>/<skill>/，git 可选（未配仓库也能装）。
+    与前端「技能上传」、离线 install_user_skill.py 同一条 save_skill_validated 入口，
+    安全校验 / shadow 冲突语义一致。
+
+    目录约定：--skill-path 指向的目录必须直接含 SKILL.md，且**目录名 == SKILL.md
+    里的 name**（后端 parser 强制 dir-name invariant）。scripts/ references/ assets/
+    等子目录会一并打包（自动跳过 .git / __pycache__ 等）。
+    """
+    if not args.skill_path:
+        sys.exit("[ERR] install_skill 需要 --skill-path（本地 skill 目录，含 SKILL.md）")
+    skill_dir = Path(args.skill_path).expanduser()
+    if not skill_dir.is_dir():
+        sys.exit(f"[ERR] --skill-path 不是目录: {skill_dir}")
+    if not (skill_dir / "SKILL.md").is_file():
+        sys.exit(f"[ERR] {skill_dir} 下找不到 SKILL.md（skill 目录必须含 SKILL.md）")
+
+    top = skill_dir.name  # 顶层目录名，后端按它做 dir-name invariant 校验
+    buf = io.BytesIO()
+    packed = []
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, dirs, files in os.walk(skill_dir):
+            dirs[:] = [
+                d for d in dirs
+                if d not in _SKILL_SKIP_DIRS and not d.startswith(".")
+            ]
+            for fn in sorted(files):
+                if fn.startswith("."):  # .DS_Store / .gitignore 之类
+                    continue
+                fp = Path(root) / fn
+                rel = fp.relative_to(skill_dir).as_posix()
+                zf.write(fp, arcname=f"{top}/{rel}")
+                packed.append(rel)
+    if "SKILL.md" not in packed:
+        sys.exit("[ERR] 打包后竟无 SKILL.md，请检查目录")
+    zip_bytes = buf.getvalue()
+    if len(zip_bytes) > _MAX_UPLOAD:
+        sys.exit(f"[ERR] 打包体积过大 {len(zip_bytes)} bytes > {_MAX_UPLOAD}")
+
+    form = {}
+    if args.overwrite:
+        form["overwrite"] = "true"
+    if args.allow_shadow:
+        form["allow_shadow"] = "true"
+    files = {"file": (f"{top}.zip", zip_bytes, "application/zip")}
+
+    try:
+        resp = requests.post(
+            f"{tok['server']}/v1/skills/install_bundle",
+            data=form,
+            files=files,
+            headers={"Authorization": tok["auth_token"]},
+            timeout=300,
+            verify=not args.insecure,
+        )
+    except requests.exceptions.RequestException as e:
+        sys.exit(f"[ERR] 请求失败: {e}")
+
+    if resp.status_code == 401:
+        sys.exit("[ERR] 认证失效，请重新运行: python scripts/login.py")
+    try:
+        body = resp.json()
+    except Exception:
+        sys.exit(f"[ERR] 非 JSON 响应: HTTP {resp.status_code} {resp.text[:300]}")
+
+    data = body.get("data") or {}
+    # 业务失败：shadow 冲突 / 校验错误 / 已存在，给可操作提示
+    if body.get("code") != 0 or not data.get("success"):
+        if data.get("needs_confirmation") and data.get("shadow_conflicts"):
+            names = ", ".join(
+                sc.get("tool_name") for sc in data["shadow_conflicts"]
+            )
+            sys.exit(
+                f"[ERR] 与 builtin 工具同名冲突: {names}。"
+                "确认要覆盖请加 --allow-shadow。"
+            )
+        sys.exit(f"[ERR] {body.get('message', data)}")
+
+    out = {
+        "ok": True,
+        "skill_name": data.get("skill_name", top),
+        "file_count": data.get("file_count", len(packed)),
+        "packed_files": sorted(packed),
+        "hint": (
+            "已装入个人技能库（skills/users/<你>/）。"
+            "在 ComboAgent 会话或前端「技能设置」即可见。"
+        ),
+    }
+    indent = None if args.raw else 2
+    print(json.dumps(out, ensure_ascii=False, indent=indent))
+
+
+def do_list_agents(args, tok: dict) -> None:
+    """列当前用户的 combo agents（只读），供 create_session 选 agent_id。
+
+    复用前端端点 GET /v1/combo_web/agents（与「新建会话」选 bot 同源），不写任何
+    云端资源。可选 --keywords 在本地按 agent 名过滤。
+    """
+    params = {
+        "canvas_type": args.canvas_type or "combo",
+        "limit": int(args.limit) if args.limit else 30,
+        "offset": int(args.offset) if args.offset else 0,
+    }
+    try:
+        resp = requests.get(
+            f"{tok['server']}/v1/combo_web/agents",
+            params=params,
+            headers={"Authorization": tok["auth_token"]},
+            timeout=30,
+            verify=not args.insecure,
+        )
+    except requests.exceptions.RequestException as e:
+        sys.exit(f"[ERR] 请求失败: {e}")
+    if resp.status_code == 401:
+        sys.exit("[ERR] 认证失效，请重新运行: python scripts/login.py")
+    try:
+        body = resp.json()
+    except Exception:
+        sys.exit(f"[ERR] 非 JSON 响应: HTTP {resp.status_code} {resp.text[:300]}")
+    if body.get("code") != 0:
+        sys.exit(f"[ERR] {body.get('message', body)}")
+    data = body.get("data") or {}
+    agents = data.get("agents") or []
+    kw = (args.keywords or "").strip().lower()
+    if kw:
+        agents = [
+            a for a in agents
+            if kw in (a.get("name") or a.get("title") or "").lower()
+        ]
+    items = [
+        {
+            "agent_id": a.get("agent_id") or a.get("id"),
+            "name": a.get("name") or a.get("title"),
+            "canvas_type": a.get("canvas_type"),
+            "updated_at": a.get("updated_at"),
+        }
+        for a in agents
+    ]
+    out = {
+        "ok": True,
+        "action": "list_agents",
+        "count": len(items),
+        "total": data.get("total"),
+        "agents": items,
+        "hint": (
+            "用 agent_id 建会话："
+            "create_session --agent-id <id> [--name <会话名>] [--first-prompt <指令>]"
+        ),
+    }
+    indent = None if args.raw else 2
+    print(json.dumps(out, ensure_ascii=False, indent=indent))
+
+
+def _resolve_agent_id(name: str, tok: dict, insecure: bool = False) -> str:
+    """agent 名 → UUID。已是 32 位 hex 直接返回；否则 GET /v1/combo_web/agents 名称匹配。
+
+    与 _resolve_session_id 同构：0 命中报错，多命中提示用更精确名称或 UUID。
+    """
+    if _UUID32_RE.match(name or ""):
+        return name
+    try:
+        resp = requests.get(
+            f"{tok['server']}/v1/combo_web/agents",
+            params={"canvas_type": "combo", "limit": 200, "offset": 0},
+            headers={"Authorization": tok["auth_token"]},
+            timeout=30,
+            verify=not insecure,
+        )
+    except requests.exceptions.RequestException as e:
+        sys.exit(f"[ERR] 解析 agent 名称失败 (list_agents): {e}")
+    if resp.status_code == 401:
+        sys.exit("[ERR] 认证失效，请重新运行: python scripts/login.py")
+    try:
+        body = resp.json()
+    except Exception:
+        sys.exit(f"[ERR] 非 JSON 响应: HTTP {resp.status_code} {resp.text[:300]}")
+    if body.get("code") != 0:
+        sys.exit(f"[ERR] {body.get('message', body)}")
+    agents = (body.get("data") or {}).get("agents") or []
+
+    def _nm(a):
+        return a.get("name") or a.get("title") or ""
+
+    exact = [a for a in agents if _nm(a) == name]
+    candidates = exact or [a for a in agents if name.lower() in _nm(a).lower()]
+    if len(candidates) == 0:
+        sys.exit(f"[ERR] 没有名为 '{name}' 的 agent（list_agents 0 命中）")
+    if len(candidates) > 1:
+        names = [
+            f"  - {_nm(a)} ({a.get('agent_id') or a.get('id')})"
+            for a in candidates[:8]
+        ]
+        sys.exit(
+            f"[ERR] 名称 '{name}' 匹配多个 agent，请用 UUID 或更精确名称:\n"
+            + "\n".join(names)
+        )
+    return candidates[0].get("agent_id") or candidates[0].get("id")
+
+
+def do_create_session(args, tok: dict) -> None:
+    """为指定 agent 在云端新建一个 session（写）。
+
+    复用前端端点 POST /v1/combo_web/agents/<agent_id>/sessions（与前端「新建会话」
+    同一入口）。--first-prompt 可在建好后立即 dispatch_task 驱动首轮，实现
+    “本地一步建会话并驱动”的闭环。
+
+    注意：服务端默认 allow_duplicate=False 时，若该 agent 已有 session，会**复用**
+    已存在的那个（不新建）；要强制新建用 --allow-duplicate。
+    """
+    if not args.agent_id:
+        sys.exit(
+            "[ERR] create_session 需要 --agent-id（agent 名称或 UUID；先用 list_agents 查）"
+        )
+    agent_uuid = _resolve_agent_id(args.agent_id, tok, insecure=args.insecure)
+    if agent_uuid != args.agent_id:
+        print(f"[INFO] resolved agent '{args.agent_id}' → {agent_uuid}", file=sys.stderr)
+
+    body = {"allow_duplicate": bool(args.allow_duplicate)}
+    if args.name:
+        body["name"] = args.name
+
+    try:
+        resp = requests.post(
+            f"{tok['server']}/v1/combo_web/agents/{agent_uuid}/sessions",
+            json=body,
+            headers={"Authorization": tok["auth_token"]},
+            timeout=60,
+            verify=not args.insecure,
+        )
+    except requests.exceptions.RequestException as e:
+        sys.exit(f"[ERR] 请求失败: {e}")
+    if resp.status_code == 401:
+        sys.exit("[ERR] 认证失效，请重新运行: python scripts/login.py")
+    try:
+        rbody = resp.json()
+    except Exception:
+        sys.exit(f"[ERR] 非 JSON 响应: HTTP {resp.status_code} {resp.text[:300]}")
+    if rbody.get("code") != 0:
+        sys.exit(f"[ERR] {rbody.get('message', rbody)}")
+
+    sess = rbody.get("data") or {}
+    session_id = sess.get("session_id") or sess.get("id")
+    if not session_id:
+        sys.exit(f"[ERR] 服务端未返回 session_id: {sess}")
+
+    out = {
+        "ok": True,
+        "action": "create_session",
+        "session_id": session_id,
+        "agent_id": agent_uuid,
+        "name": sess.get("name") or sess.get("session_name"),
+        "hint": (
+            "用 dispatch_task --session-id <session_id> --prompt <指令> 驱动执行；"
+            "或 get_digest --session-id <session_id> 看进度。"
+        ),
+    }
+
+    if args.first_prompt:
+        payload = _dispatch_to_session(
+            session_id, args.first_prompt, tok, insecure=args.insecure
+        )
+        out["dispatched"] = True
+        out["first_prompt"] = args.first_prompt
+        out["queued_at_ms"] = payload.get("queued_at_ms")
+        out["hint"] = (
+            "已建会话并派发首轮。用 get_digest --session-id "
+            f"{session_id} 看新一轮概览（get_round 需具体 round 号）。"
+        )
+
+    indent = None if args.raw else 2
+    print(json.dumps(out, ensure_ascii=False, indent=indent))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="graft-comboagent 调用入口",
@@ -673,7 +968,8 @@ def main() -> None:
         help="list_sessions | get_digest | get_round | search | "
              "search_by_artifact | read_file | list_files | grep_file | "
              "list_documents | get_doc_profile | list_chunks | download | "
-             "list_kbs | kb_detail | dispatch_task | upload",
+             "list_kbs | kb_detail | list_agents | create_session | "
+             "dispatch_task | upload | install_skill",
     )
     for field, flags in _ARG_ALIAS.items():
         ap.add_argument(*flags, dest=field, default=None)
@@ -700,6 +996,22 @@ def main() -> None:
                     help="upload: 并发上传线程数（默认 8；--workers 1 退回顺序）")
     ap.add_argument("--no-manifest", action="store_true",
                     help="upload: 不写本地 content_hash→local_path 映射清单")
+    # ── install_skill 专属 ──
+    ap.add_argument("--skill-path", dest="skill_path", default=None,
+                    help="install_skill: 本地 skill 目录（含 SKILL.md，目录名须等于 skill 名）")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="install_skill: 同名技能已存在时覆盖（默认拒绝）")
+    ap.add_argument("--allow-shadow", dest="allow_shadow", action="store_true",
+                    help="install_skill: 允许覆盖 builtin 同名 tool（罕见，谨慎）")
+    # ── list_agents / create_session 专属 ──
+    ap.add_argument("--agent-id", dest="agent_id", default=None,
+                    help="create_session: 目标 agent 名称或 UUID（先用 list_agents 查）")
+    ap.add_argument("--canvas-type", dest="canvas_type", default=None,
+                    help="list_agents: 过滤 canvas_type（默认 combo）")
+    ap.add_argument("--first-prompt", dest="first_prompt", default=None,
+                    help="create_session: 建好会话后立即派发的首条指令（一步建并驱动）")
+    ap.add_argument("--allow-duplicate", dest="allow_duplicate", action="store_true",
+                    help="create_session: 强制新建（默认复用该 agent 已有 session）")
     ap.add_argument("--raw", action="store_true",
                     help="JSON 输出不 pretty-print")
     ap.add_argument("--insecure", action="store_true",
@@ -712,8 +1024,10 @@ def main() -> None:
 
     # ⚠️ 显式拒绝任何写/删类动作，即使 token 技术上能调那些端点。
     # 这是 skill 层的产品策略，与服务端白名单无关。
-    # 写动作只放行两个：dispatch_task（向已有 session 排队执行）与 upload
-    # （把本地文件灌进指定 KB）。其余 create/save/delete… 一律拒。
+    # 放行的写动作：dispatch_task（向已有 session 排队执行）、upload（灌文件进 KB）、
+    # install_skill（装技能进个人库）、create_session（为 agent 新建会话）。
+    # 其余 rm/save/update/delete… 一律拒（注意 "create" 仍禁，create_session
+    # 是显式放行的具体动作，与裸 "create" 不同）。
     _BANNED_ACTIONS = frozenset({
         "rm", "delete", "remove", "save", "create", "update", "patch", "put",
         "copy_kb_document", "register_artifact",
@@ -737,6 +1051,12 @@ def main() -> None:
         do_dispatch(args, tok)
     elif args.action in ("upload", "upload_document"):
         do_upload(args, tok)
+    elif args.action == "install_skill":
+        do_install_skill(args, tok)
+    elif args.action == "list_agents":
+        do_list_agents(args, tok)
+    elif args.action == "create_session":
+        do_create_session(args, tok)
     else:
         do_unified(args, tok)
 

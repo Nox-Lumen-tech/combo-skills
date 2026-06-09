@@ -10,7 +10,7 @@ metadata:
 
 # Graft-Comboagent — ragbase 远程客户端
 
-本地 agent（Cursor / Claude Code / Codex）通过本 skill 直连云端 ragbase，做四件事：
+本地 agent（Cursor / Claude Code / Codex）通过本 skill 直连云端 ragbase，做这些事：
 
 | 用途 | 说明 | 写入云端？ | 是否需要云端先跑过 session |
 |---|---|---|---|
@@ -18,9 +18,12 @@ metadata:
 | **B. Session 嫁接** | 拉某次 comboagent 跑出来的 digest / round / 产出物，对照本地代码做分析 | 否 | 需要 |
 | **C. 派发任务** | 把指令派给已存在的某个 session，让云端 agent 排队跑一轮（异步） | 触发执行（不创建/删除资源） | 需要（目标 session 必须已存在） |
 | **D. 上传到 KB**（`upload`） | 把本地文件灌进**指定 KB**，可选触发解析；本地的 findings / 缺陷 / 报告回流云端 KB | **是**（入库；仅限你有权限的 KB） | 不需要 |
+| **E. 安装 skill**（`install_skill`） | 把本地 skill 目录（SKILL.md + scripts/references）打包装进**你自己**的云端技能库；git 可选 | **是**（写入 skills/users/你/） | 不需要 |
+| **F. 列 agents**（`list_agents`，辅助） | 列出你名下的 combo agents（bot），拿 `agent_id` 去建会话 | 否 | 不需要 |
+| **G. 创建 session**（`create_session`） | 为指定 agent 新建会话；可 `--first-prompt` 一步建好并派发首轮，与 dispatch_task 形成"本地建会话→驱动执行"闭环 | **是**（建会话记录） | 不需要 |
 
-> 服务端实现在 `AgentFlow/src/skills/builtin/graft` 与 `api/apps/graft_app.py` / `api/apps/kb_app.py`；`upload` 直接复用平台现成的 `/v1/document/upload`（+ 可选 `/v1/document/run`），与云端 agent 的 `kb_upload` / `kb_parse` 同源。
-> 本 skill 是这些 HTTP 端点的本地包装。**写边界很窄**：只有 `dispatch_task` 和 `upload` 两个写动作，其余全部只读。
+> 服务端实现在 `AgentFlow/src/skills/builtin/graft` 与 `api/apps/graft_app.py` / `api/apps/kb_app.py`；`upload` 直接复用平台现成的 `/v1/document/upload`（+ 可选 `/v1/document/run`），`install_skill` 复用 `/v1/skills/install_bundle`，`list_agents` / `create_session` 复用前端现成的 `/v1/combo_web/agents`(GET) 与 `/v1/combo_web/agents/<id>/sessions`(POST)，均与云端 agent / 前端同源。
+> 本 skill 是这些 HTTP 端点的本地包装。**写边界很窄**：只有 `dispatch_task`、`upload`、`install_skill` 和 `create_session` 四个写动作，其余全部只读（含新增的只读 `list_agents`）。
 
 > 🌳 **不知道用哪条 action？先查 [`references/action-decision-tree.md`](references/action-decision-tree.md)** —— 按"用户意图"分类的 9 分支决策树，本地 LLM 1 秒选中。
 
@@ -31,6 +34,8 @@ metadata:
 ### 0. 配置 server（多租户 / 自部署 — 一次就够）
 
 **默认** `https://xipnex.nox-lumen.com`（公有云）。自部署 / 内网 / 临时 cloudflare tunnel 用 `python scripts/login.py --server <URL>` 或 `GRAFT_COMBOAGENT_SERVER=<URL>` 覆盖一次即可——server 会和 token 一起持久化到 `~/.config/graft-comboagent/token.json`，之后所有 `call.py` 自动指向它。
+
+> ⚠️ **切 server 一律走 `login.py` 重登，绝不要手改 `token.json` 的 `server` 字段**：手改只换了地址、`auth_token` 还是旧 server 登的那个，仅在两端碰巧共用同一数据库时才凑效，否则直接 401，还会留下不一致状态。换环境 = `login.py --server <新URL>` 重登一次即可。
 
 **官方获取入口**：用户在 [`https://xipnex.nox-lumen.com/combospace/user-setting/skills`](https://xipnex.nox-lumen.com/combospace/user-setting/skills) 可以查看/复制属于自己的 combo-agent 访问地址。如果用户没明确说用哪个 server，agent 应先建议他从这里复制。
 
@@ -106,11 +111,30 @@ python scripts/login.py --server <URL> --email <email> --password <pwd>
 - ✅ 不创建任何新 session、文件、记录
 - ✅ 服务端复用既有的 `_DISPATCH_SEMAPHORE` 做并发控制
 - ❌ HTTP 派发**不支持 wait=True**（本地没有 source session 可挂起）；要等结果就用 `get_digest` / `get_round` 轮询
-- ❌ 不能用来批量派发 / 创建 session（那是产品功能，不是 skill 能做的）
+- ❌ 本动作自身不创建 session（要新建会话用下面的 `create_session`）；也不做批量派发
 
 ⚠️ **依赖后端部署**：`/v1/graft/dispatch_task` 是新加的端点，需要后端跑了带这个改动的版本。如果返回 `[ERR] Not Found`，说明目标 server 还没部署。已部署能力（list_kbs / search / get_digest 等）不受影响。
 
 典型用途：本地 agent 决定"这个 KB 检索结果不够，要让云端某个长跑 session 重新跑一轮带上新指令" → 派任务回去 → 用 `get_digest` 看新一轮产出。
+
+### C+. 创建 session 并驱动（create_session / list_agents）
+
+`dispatch_task` 只能派给**已存在**的 session。要从本地**新建** session 再驱动，用 `create_session`（第四个写口）；选哪个 bot 先用 `list_agents`（只读）拿 `agent_id`。
+
+| 操作 | 命令 |
+|---|---|
+| **列我的 agents（bot）** | `python scripts/call.py list_agents [--keywords <名字片段>] [--limit 30]` |
+| **为某 agent 建会话** | `python scripts/call.py create_session --agent-id <名称或UUID> --name "<会话名>"` |
+| **一步建会话并派发首轮** | `python scripts/call.py create_session --agent-id <id> --name "<会话名>" --first-prompt "<首条指令>"` |
+| 强制新建（不复用已有） | `... create_session --agent-id <id> --allow-duplicate` |
+
+**关键约定**：
+- `--agent-id` 支持 **agent 名称或 UUID**；传名称时本地用 `list_agents` 解析（0 命中报错，多命中要求更精确名称或 UUID）。
+- **默认复用**：服务端 `allow_duplicate=False` 时，若该 agent 已有 session，会**返回已存在的那个**（不新建）；要每次都开新会话加 `--allow-duplicate`。
+- `--first-prompt` = 建好后立即 `dispatch_task` 派发首轮（异步），返回里带 `dispatched=true` + `queued_at_ms`；之后用 `get_digest --session-id <sid>` 看新一轮概览（服务端 `get_round` 需具体 round 号，不支持 `-1`）。
+- 复用前端「新建会话」同一入口（`/v1/combo_web/agents/<id>/sessions`），**是老端点、无需后端新部署**；建的 session 在前端会话列表、`list_sessions` 里都能看到。
+
+**闭环**：`list_agents` → `create_session --first-prompt` → `get_round` 轮询——本地全程不碰前端即可开一个新会话并驱动它跑。
 
 ### D. 上传本地文件到 KB（upload — 第二个、也是唯一的"入库"写口）
 
@@ -137,7 +161,29 @@ python scripts/login.py --server <URL> --email <email> --password <pwd>
 
 ⚠️ **依赖后端可达**：`upload` 命中的是 ragbase 主服务的 `/v1/document/upload`，和 `list_kbs` 同一个 server；如果 `list_kbs` 能通，`upload` 就能通。
 
-### E. search 高级过滤（小众但 unified_search 支持）
+### E. 安装本地 skill 到云端个人技能库（install_skill — 第三个写口）
+
+把本地一个 skill 目录（含 `SKILL.md`，外加 `scripts/` `references/` `assets/` 等）打包上传到**你自己**的云端技能库。**git 可选**：未配置技能管理仓库也能装（直接进 MinIO `skills/users/<你>/`）；配了仓库则照旧，可事后在仓库做版本管理。
+
+| 操作 | 命令 |
+|---|---|
+| **安装本地 skill 目录** | `python scripts/call.py install_skill --skill-path ./my-skill` |
+| 覆盖同名已装技能 | `python scripts/call.py install_skill --skill-path ./my-skill --overwrite` |
+| 允许覆盖 builtin 同名 tool（罕见） | `python scripts/call.py install_skill --skill-path ./my-skill --allow-shadow` |
+
+**关键约定**：
+- `--skill-path` 必须是**目录**，目录里直接有 `SKILL.md`；且**目录名 == SKILL.md 的 `name`**（后端 parser 强制 dir-name invariant，不一致会被拒）。
+- 子目录（`scripts/` `references/` `assets/`…）会**一并打包**；`.git` / `__pycache__` / `node_modules` / `.venv` 等自动跳过。
+- 默认**同名拒绝**，要替换已装技能加 `--overwrite`。
+- 服务端走 **Layer-8 SkillSafetyValidator**（和前端「技能上传」、离线 `install_user_skill.py` 同一道闸）：可执行 tool 命名冲突、危险写法会被拦；与 builtin 同名 tool 默认拒绝，确认覆盖才加 `--allow-shadow`。
+- 只写进**你本人**的 `skills/users/<你>/`，不碰他人 / builtin。
+- 装完即时可用：在 ComboAgent 会话或前端「技能设置」即可见。
+
+返回 JSON 关键字段：`skill_name` / `file_count` / `packed_files`（实际打包的相对路径列表）。
+
+⚠️ **依赖后端部署**：`install_skill` 命中的是 `/v1/skills/install_bundle`（本次新增端点）。若返回 `Not Found`，说明目标 server 还没部署带此端点的版本；其余命令不受影响。
+
+### F. search 高级过滤（小众但 unified_search 支持）
 
 `search` action 除了 `--query / --kb-ids / --doc-ids / --top-k / --source`，还透传：
 
@@ -149,13 +195,15 @@ python scripts/login.py --server <URL> --email <email> --password <pwd>
 
 > 这些参数和上面 A/B 节里的命令可以**任意组合**——本 skill 把所有非 dispatch / 非 KB-only 字段透传给 unified_search，用法对齐云端 agent 工具签名（详见 `AgentFlow/src/memory/memory_os.py::create_tool`）。
 
-### 严格只读边界（仅 dispatch_task / upload 两个写口）
+### 严格只读边界（仅 dispatch_task / upload / install_skill / create_session 四个写口）
 
-`call.py` 在分发前会拒绝任何 `rm` / `delete` / `remove` / `save` / `create` / `update` / `patch` / `put` 类 action，以及服务端禁用的 `copy_kb_document` / `register_artifact`。即便你的 token 在技术上能调那些端点，本 skill 也不给入口。**删除 / 改写 KB 已有内容请走前端 UI**。
+`call.py` 在分发前会拒绝任何 `rm` / `delete` / `remove` / `save` / `update` / `patch` / `put` 类 action，以及裸 `create`、服务端禁用的 `copy_kb_document` / `register_artifact`。即便你的 token 在技术上能调那些端点，本 skill 也不给入口。**删除 / 改写 KB 已有内容请走前端 UI**。
 
-只有两个写动作放行：
+只有四个写动作放行：
 - `dispatch_task`：向**已有** session 排队一次执行，不修改 / 创建 / 删除任何持久化资源。
 - `upload`：把**本地文件**灌进**你有权限的指定 KB**（可选触发解析）。它新建 doc、不删/改 KB 既有内容；服务端用 `current_user` 校验 KB 归属。
+- `install_skill`：把**本地 skill 目录**打包装进**你本人**的技能库（`skills/users/<你>/`）。服务端 Layer-8 校验后才落库；不碰他人 / builtin。
+- `create_session`：为**你名下的** agent 新建一个会话（可选 `--first-prompt` 派发首轮）。只建会话记录、复用前端「新建会话」同一入口；不删/改任何既有资源。（注意：被拒的是**裸 `create`**，`create_session` 是这里显式放行的具体动作。）
 
 > 安全说明：`upload` 没有放宽任何服务端闸 —— graft 的 token 本来就是完整用户会话签名，技术上一直能命中 `/v1/document/upload`（和浏览器登录态等价）。本次只是在本地 skill 暴露了这个入口，并把它收窄成"只上传到指定 KB"。
 
@@ -271,8 +319,9 @@ dispatch 在已有 session 里**起一个新 episode**（独立的执行任务�
 - **先 Digest 后 drill down** — 不要盲搜，先看全貌再定点取回
 - 名称匹配多个 KB / session 时向用户确认，不要自行选择
 - 可见范围包括自己的资源 + 团队共享的资源（list 接口已自动合并）
-- 除 `dispatch_task` / `upload` 外其余命令**只读**，不会修改云端任何数据；其余写操作在 skill 层 + 服务端双重拦截
+- 除 `dispatch_task` / `upload` / `install_skill` 外其余命令**只读**，不会修改云端任何数据；其余写操作在 skill 层 + 服务端双重拦截
 - `upload` 默认**只上传不解析**，要进检索得显式 `--parse`；只上传到你有权限的 KB，不删/改 KB 既有内容
+- `install_skill` 只装进**你本人**技能库（`skills/users/<你>/`）；目录名须等于 skill 名；走 Layer-8 安全校验，git 可选
 - 原始字节文件只走 `download`，不读进 AI 上下文
 - **不要把 `dispatch_task` 当成 fire-and-forget 的批量分发**：每次调用都消耗云端 agent 资源（CPU + LLM token）
 
@@ -304,3 +353,8 @@ dispatch 在已有 session 里**起一个新 episode**（独立的执行任务�
 | `upload` 返回 ok 但 KB 里搜不到内容 | 没加 `--parse`，文件只上传未解析（无 chunks） | 加 `--parse` 重传，或前端 KB 页点解析；`list_documents --kb-ids <id>` 看 run/progress |
 | `upload --parser-id` 报 `Unknown parser_id` | parser_id 不在 KB 白名单 | 去掉 `--parser-id` 用 KB 默认；或查 `GET /v1/parser/discover` |
 | `upload` 报 `文件过大 ... > ...` | 单文件 > 200 MB | 大文件走前端 KB 上传，不走本 skill |
+| `install_skill` 报 `--skill-path 不是目录` / `找不到 SKILL.md` | 路径不对，或指到了单个文件 | `--skill-path` 要指向**目录**，且目录里有 `SKILL.md` |
+| `install_skill` 报 dir-name invariant / `name` 不匹配 | skill 目录名 ≠ SKILL.md 里的 `name` | 重命名目录使其等于 `name`，再装 |
+| `install_skill` 报 `与 builtin 工具同名冲突` | skill 的 tool 名撞 builtin | 改 tool 名；确需覆盖加 `--allow-shadow`（罕见） |
+| `install_skill` 报 `already exists` | 同名技能已装 | 确认要替换加 `--overwrite` |
+| `install_skill` 返回 `Not Found` | 后端没部署 `/v1/skills/install_bundle` | 确认目标 server 跑的是带此端点的版本；其他命令不受影响 |
