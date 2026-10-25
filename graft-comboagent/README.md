@@ -12,13 +12,15 @@
 |---|---|---|---|
 | **A. KB 检索**（核心高频） | `list_kbs` / `kb_detail` / `search --source document` / `list_documents` / `get_doc_profile` / `list_chunks` | 否 | 不需要 |
 | **B. Session 嫁接** | `list_sessions` / `get_digest` / `get_round` / `search` / `read_file` / `download` / `list_files` / `search_by_artifact` / `grep_file` | 否 | 需要 |
+| **I. KB chunk 修补** | `download_document` / `list_doc_chunks` / `get_chunk` / `patch_chunk` / `create_chunk` / `delete_chunks` + `scripts/excel_link.py` | **是**（改 ES chunk） | 需要（doc 已 parse） |
 | **C. 派发任务** | `dispatch_task` | 触发执行（不增删资源） | 需要 |
 | **D. 上传到 KB** | `upload`（可选 `--parse`） | **是**（入库） | 不需要 |
 | **E. 安装 skill 到云端** | `install_skill` | **是**（写 `skills/users/你/`） | 不需要 |
 | **F. 列 agents**（辅助） | `list_agents` | 否 | 不需要 |
 | **G. 新建并驱动 session** | `create_session`（可 `--first-prompt`） | **是**（建会话记录） | 不需要 |
+| **H. 接线脚本工具** | `wire_script_tools`（把无 manifest 的 skill 脚本接成动态工具；底层 = dispatch_task） | 触发执行（agent 自编程写 registry） | 需要 |
 
-> **写边界很窄**：只有 `dispatch_task`、`upload`、`install_skill`、`create_session` 四个写动作，其余全部只读（含只读的 `list_agents`）。删除 / 改写 KB 已有内容请走前端 UI。
+> **写边界**：`dispatch_task` / `upload` / `install_skill` / `create_session` / `patch_chunk` / `create_chunk` / `delete_chunks`。不要用 re-parse 修 Excel 链接。
 > 详细用法、上下文节流规则、按意图分类的决策树见 `SKILL.md`（LLM 读）与 `references/action-decision-tree.md`。
 
 ---
@@ -29,7 +31,8 @@
   - `/v1/graft/memory/unified_search` — 检索 / 列表 / digest / round / read_file
   - `/v1/graft/memory/download` — 原始字节下载
   - `/v1/graft/dispatch_task` — 向已有 session 异步派发一轮（**新端点**）
-  - `/v1/document/upload`（+ 可选 `/v1/document/run`）— 上传本地文件进 KB
+  - `/v1/document/get/<doc_id>` — KB 原文件下载（`download_document`）
+  - `/v1/chunk/list|set|create|rm` — KB chunk 读/写（`list_doc_chunks` / `patch_chunk` …）
   - `/v1/skills/install_bundle` — 安装本地 skill 进个人技能库（**新端点**）
   - `/v1/combo_web/agents`(GET) / `/v1/combo_web/agents/<id>/sessions`(POST) — 列 agents / 新建会话
 - **客户端**：本 skill 提供 4 个 Python 脚本（login / whoami / logout / call），帮你用 email + password 登录并访问上述端点
@@ -67,10 +70,13 @@ graft-comboagent/
 │   ├── action-decision-tree.md              # 按用户意图分类的 action 决策树（选哪条命令）
 │   └── cross-session-retrieval.md           # 跨 session 检索的深度说明
 └── scripts/
-    ├── login.py                             # 登录：email + password (+ --server) → 保存 token
-    ├── whoami.py                            # 显示当前登录身份
-    ├── logout.py                            # 删除本地 token
-    └── call.py                              # 统一调用入口（所有读 / 写 action + download）
+    ├── login.py                             # 登录
+    ├── whoami.py                            # 身份
+    ├── logout.py                            # 登出
+    ├── call.py                              # 统一调用（含 KB chunk patch）
+    ├── excel_link.py                        # 从 xlsx 抽超链接
+    ├── enrich_chunk.py                      # 合并 URL 进 chunk 正文
+    └── test_enrich_chunk.py                 # enrich 自检
 ```
 
 ---
@@ -142,6 +148,9 @@ python scripts/call.py upload --kb-id <kb_id> --file ./缺陷分析.md --parse
 python scripts/call.py install_skill --skill-path ./my-skill
 python scripts/call.py list_agents --keywords 报价          # 先拿 agent_id（只读）
 python scripts/call.py create_session --agent-id <id> --name "新会话" --first-prompt "开始分析"
+
+# 6) 把无 manifest 的 skill 脚本接成动态工具（底层 = dispatch_task，异步）
+python scripts/call.py wire_script_tools --skill-name qa --session-id "新会话"
 ```
 
 ---

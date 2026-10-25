@@ -5,6 +5,11 @@ import os
 import sys
 from pathlib import Path
 
+try:
+    import requests
+except ImportError:
+    requests = None
+
 TOKEN_PATH = Path(
     os.environ.get(
         "GRAFT_COMBOAGENT_TOKEN",
@@ -26,8 +31,26 @@ def main() -> None:
     server = t.get("server") or "?"
     uid = t.get("user_id") or "?"
     uid_short = uid[:8] + "…" if len(uid) > 8 else uid
-    print(f"{email} @ {server} (user_id={uid_short})")
+    print(f"{email} @ {server}")
+    print(f"  user_id / 自己的 tenant_id: {uid}")
     print(f"  token file: {TOKEN_PATH}")
+    print("  共享 KB 的 tenant_id 见 list_kbs 每条里的 tenant_id，一般不用手填。")
+
+    if requests and server and t.get("auth_token"):
+        try:
+            resp = requests.post(
+                f"{server.rstrip('/')}/v1/kb/list",
+                json={"owner_ids": []},
+                headers={"Authorization": t["auth_token"]},
+                timeout=30,
+            )
+            body = resp.json()
+            if body.get("code") == 0:
+                kbs = (body.get("data") or {}).get("kbs") or []
+                if kbs:
+                    print(f"  可见 KB: {len(kbs)} 个（list_kbs 可查详情）")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

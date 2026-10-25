@@ -50,6 +50,12 @@ content_hash → local_path 记到 .graft/uploads/manifest.jsonl，便于召回�
     # 安装本地 skill 目录到云端个人技能库（目录名须等于 skill 名，目录内含 SKILL.md）：
     call.py install_skill --skill-path ./my-skill
     call.py install_skill --skill-path ./my-skill --overwrite
+    # KB chunk 修补（不改 parse；patch 时云端 re-embed）：
+    call.py download_document --doc-id <doc_id> [--out ./local.xlsx]
+    call.py list_doc_chunks --doc-id <doc_id>
+    call.py patch_chunk --doc-id <id> --chunk-id <id> --content "补全后的正文"
+    call.py create_chunk --doc-id <id> --content "..."
+    call.py delete_chunks --doc-id <id> --chunk-ids id1,id2
 """
 import argparse
 import hashlib
@@ -57,6 +63,7 @@ import io
 import json
 import mimetypes
 import os
+import re
 import sys
 import time
 import zipfile
@@ -114,7 +121,9 @@ _ARG_ALIAS = {
     # ── KB / doc / chunk ──
     "kb_ids":     ["--kb-ids"],
     "doc_ids":    ["--doc-ids"],
+    "doc_id":     ["--doc-id"],
     "chunk_ids":  ["--chunk-ids"],
+    "chunk_id":   ["--chunk-id"],
     "window":     ["--window"],
     # ── read_file 行模式 ──
     "line_start": ["--line-start"],
@@ -212,6 +221,450 @@ def do_download(args, tok: dict) -> None:
         "bytes": total,
         "source": args.path,
     }, ensure_ascii=False, indent=2))
+
+
+def _api_json(method: str, path: str, tok: dict, *, json_body=None, params=None, insecure=False):
+    """HTTP 调 ragbase JSON API；401/非 0 code 直接 sys.exit。"""
+    url = f"{tok['server'].rstrip('/')}{path}"
+    headers = {"Authorization": tok["auth_token"]}
+    try:
+        resp = requests.request(
+            method, url, json=json_body, params=params,
+            headers=headers, timeout=120, verify=not insecure,
+        )
+    except requests.exceptions.RequestException as e:
+        sys.exit(f"[ERR] 请求失败: {e}")
+    if resp.status_code == 401:
+        sys.exit("[ERR] 认证失效，请重新运行: python scripts/login.py")
+    ctype = (resp.headers.get("Content-Type") or "").lower()
+    if "application/json" not in ctype:
+        sys.exit(f"[ERR] 非 JSON 响应: HTTP {resp.status_code} {resp.text[:300]}")
+    try:
+        data = resp.json()
+    except Exception:
+        sys.exit(f"[ERR] JSON 解析失败: HTTP {resp.status_code} {resp.text[:300]}")
+    if data.get("code") != 0:
+        sys.exit(f"[ERR] {data.get('message', data)}")
+    return data.get("data")
+
+
+def _read_content_arg(args) -> str:
+    if getattr(args, "content_file", None):
+        p = Path(args.content_file).expanduser()
+        if not p.is_file():
+            sys.exit(f"[ERR] --content-file 不是文件: {p}")
+        return p.read_text(encoding="utf-8")
+    if getattr(args, "content", None) is not None:
+        return args.content
+    sys.exit("[ERR] 需要 --content 或 --content-file")
+
+
+def _resolve_doc_filename(doc_id: str, tok: dict, insecure: bool = False) -> str:
+    """从 /v1/chunk/list 拿 doc 元信息里的文件名（轻量）。"""
+    try:
+        doc = _api_json(
+            "POST", "/v1/chunk/list", tok,
+            json_body={"doc_id": doc_id, "page": 1, "size": 1},
+            insecure=insecure,
+        ).get("doc") or {}
+        name = doc.get("name") or doc.get("doc_name") or ""
+        return name if isinstance(name, str) else ""
+    except SystemExit:
+        return ""
+
+
+def do_download_document(args, tok: dict) -> None:
+    """下载 KB 文档原始字节（xlsx/docx/pdf…）。
+
+    走 /v1/document/get/<doc_id>，与前端 KB 页「下载」同源。
+    """
+    doc_id = args.doc_id
+    if not doc_id and args.doc_ids:
+        parts = [x.strip() for x in str(args.doc_ids).split(",") if x.strip()]
+        doc_id = parts[0] if parts else None
+    if not doc_id:
+        sys.exit("[ERR] download_document 需要 --doc-id（或 --doc-ids 取第一个）")
+
+    url = f"{tok['server'].rstrip('/')}/v1/document/get/{doc_id}"
+    try:
+        resp = requests.get(
+            url,
+            headers={"Authorization": tok["auth_token"]},
+            stream=True,
+            timeout=300,
+            verify=not args.insecure,
+        )
+    except requests.exceptions.RequestException as e:
+        sys.exit(f"[ERR] 请求失败: {e}")
+
+    if resp.status_code == 401:
+        sys.exit("[ERR] 认证失效，请重新运行: python scripts/login.py")
+
+    ctype = (resp.headers.get("Content-Type") or "").lower()
+    if "application/json" in ctype:
+        try:
+            body = resp.json()
+        except Exception:
+            sys.exit(f"[ERR] HTTP {resp.status_code}: {resp.text[:300]}")
+        sys.exit(f"[ERR] {body.get('message', body)}")
+
+    if resp.status_code != 200:
+        sys.exit(f"[ERR] HTTP {resp.status_code}: {resp.text[:300]}")
+
+    fname = args.filename or _resolve_doc_filename(doc_id, tok, insecure=args.insecure) or doc_id
+    out_path = Path(args.out) if args.out else (DEFAULT_DL_DIR / fname)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    total = 0
+    with open(out_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=65536):
+            if chunk:
+                f.write(chunk)
+                total += len(chunk)
+
+    out = {
+        "ok": True,
+        "action": "download_document",
+        "doc_id": doc_id,
+        "saved_to": str(out_path),
+        "bytes": total,
+        "hint": "本地 openpyxl 抽链接: python scripts/excel_link.py --file <path> --cell B5",
+    }
+    indent = None if args.raw else 2
+    print(json.dumps(out, ensure_ascii=False, indent=indent))
+
+
+def _resolve_doc_id(args) -> str | None:
+    doc_id = getattr(args, "doc_id", None)
+    if not doc_id and getattr(args, "doc_ids", None):
+        parts = _split_csv_ids(args.doc_ids)
+        doc_id = parts[0] if parts else None
+    return doc_id or None
+
+
+def _fetch_doc_chunks_page(
+    tok: dict, doc_id: str, *, page: int, size: int, keywords: str = "", insecure: bool = False,
+) -> dict:
+    body = {"doc_id": doc_id, "page": page, "size": size}
+    if keywords:
+        body["keywords"] = keywords
+    return _api_json("POST", "/v1/chunk/list", tok, json_body=body, insecure=insecure)
+
+
+def _fetch_doc_chunks_all(
+    tok: dict, doc_id: str, *, keywords: str = "", page_size: int = 100, insecure: bool = False,
+) -> tuple[list, dict | None, int]:
+    """按文档顺序拉全量 chunks（/v1/chunk/list 分页），team 共享库可用。"""
+    page_size = max(1, min(int(page_size), 200))
+    all_chunks: list = []
+    doc_meta = None
+    total = 0
+    page = 1
+    while page <= 100:
+        data = _fetch_doc_chunks_page(
+            tok, doc_id, page=page, size=page_size, keywords=keywords, insecure=insecure,
+        )
+        batch = data.get("chunks") or []
+        if doc_meta is None:
+            doc_meta = data.get("doc")
+        total = int(data.get("total") or total or len(batch))
+        if not batch:
+            break
+        all_chunks.extend(batch)
+        if len(all_chunks) >= total:
+            break
+        page += 1
+    return all_chunks, doc_meta, total
+
+
+def _chunk_list_items(chunks: list, *, target_ids: set | None = None) -> tuple[list, list]:
+    """graft list_chunks 兼容输出：metadata.items + content.items。"""
+    metadata_items, content_items = [], []
+    for c in chunks:
+        cid = c.get("chunk_id") or c.get("id") or ""
+        text = c.get("content_with_weight") or c.get("content") or ""
+        meta = {
+            "chunk_id": cid,
+            "doc_type": c.get("doc_type_kwd") or "text",
+            "token_estimate": max(1, len(text) // 4),
+        }
+        positions = c.get("positions") or c.get("position_int") or []
+        if positions:
+            meta["page_num"] = positions[0][0] if isinstance(positions[0], list) else positions[0]
+        img_id = c.get("image_id") or c.get("img_id") or ""
+        if img_id:
+            meta["image_url"] = f"/v1/document/image/{img_id}"
+        if target_ids and cid in target_ids:
+            meta["is_target"] = True
+        metadata_items.append(meta)
+        content_items.append({"chunk_id": cid, "text": text})
+    return metadata_items, content_items
+
+
+def do_list_doc_chunks(args, tok: dict) -> None:
+    """列某 KB 文档的 chunk（含 content_with_weight，可分页）。
+
+    走 /v1/chunk/list（前端 KB chunk 页同源），比 unified_search list_chunks
+    更适合 patch 前读取现有正文。
+    """
+    doc_id = _resolve_doc_id(args)
+    if not doc_id:
+        sys.exit("[ERR] list_doc_chunks 需要 --doc-id")
+
+    page = int(args.page or 1)
+    size = int(args.page_size or args.limit or 30)
+    keywords = (args.query or "").strip()
+    data = _fetch_doc_chunks_page(tok, doc_id, page=page, size=size, keywords=keywords, insecure=args.insecure)
+    out = {
+        "ok": True,
+        "action": "list_doc_chunks",
+        "doc_id": doc_id,
+        "total": data.get("total", 0),
+        "page": page,
+        "size": size,
+        "doc": data.get("doc"),
+        "chunks": data.get("chunks", []),
+        "via": "native:/v1/chunk/list",
+        "hint": (
+            "改某条: patch_chunk --doc-id <id> --chunk-id <chunk_id> --content '...'"
+        ),
+    }
+    indent = None if args.raw else 2
+    print(json.dumps(out, ensure_ascii=False, indent=indent))
+
+
+def do_list_chunks_native(args, tok: dict) -> None:
+    """KB 文档 list_chunks — 走 /v1/chunk/list + /v1/chunk/get，不经 graft MemoryOS。
+
+    与 unified_search list_chunks 输出格式兼容（metadata + content），team 共享库可用。
+    """
+    chunk_ids = _split_csv_ids(getattr(args, "chunk_ids", None))
+    window = max(0, int(getattr(args, "window", None) or 0))
+    limit = max(0, int(getattr(args, "limit", None) or 0))
+    offset = max(0, int(getattr(args, "offset", None) or 0))
+    insecure = getattr(args, "insecure", False)
+
+    if chunk_ids:
+        fetched: list = []
+        for cid in chunk_ids:
+            data = _api_json(
+                "GET", "/v1/chunk/get", tok, params={"chunk_id": cid}, insecure=insecure,
+            )
+            if isinstance(data, dict):
+                row = dict(data)
+                row.setdefault("chunk_id", row.get("id") or cid)
+                fetched.append(row)
+
+        target_ids = set(chunk_ids)
+        mode = "chunk_ids"
+        if window > 0 and fetched:
+            doc_id = fetched[0].get("doc_id")
+            if doc_id:
+                all_chunks, _, _ = _fetch_doc_chunks_all(tok, doc_id, insecure=insecure)
+                id_order = [c.get("chunk_id") or c.get("id") for c in all_chunks]
+                want: list = []
+                seen: set = set()
+                for tid in chunk_ids:
+                    if tid not in id_order:
+                        continue
+                    idx = id_order.index(tid)
+                    lo, hi = max(0, idx - window), min(len(all_chunks), idx + window + 1)
+                    for c in all_chunks[lo:hi]:
+                        cid = c.get("chunk_id") or c.get("id")
+                        if cid and cid not in seen:
+                            seen.add(cid)
+                            want.append(c)
+                if want:
+                    fetched = want
+                mode = f"chunk_ids+window({window})"
+
+        if not fetched:
+            out = {
+                "metadata": {
+                    "status": "no_result",
+                    "action": "list_chunks",
+                    "mode": mode,
+                    "chunk_ids": chunk_ids,
+                    "total_chunks": 0,
+                    "items": [],
+                    "via": "native:/v1/chunk/get",
+                },
+                "content": {"items": []},
+                "compressible": True,
+                "flush_group": "retrieval",
+            }
+        else:
+            meta_items, content_items = _chunk_list_items(fetched, target_ids=target_ids if window > 0 else None)
+            if limit > 0:
+                meta_items, content_items = meta_items[:limit], content_items[:limit]
+            out = {
+                "metadata": {
+                    "status": "success",
+                    "action": "list_chunks",
+                    "mode": mode,
+                    "total_chunks": len(meta_items),
+                    "items": meta_items,
+                    "via": "native:/v1/chunk/get" + ("/v1/chunk/list" if window > 0 else ""),
+                },
+                "content": {"items": content_items},
+                "compressible": True,
+                "flush_group": "retrieval",
+            }
+        indent = None if args.raw else 2
+        print(json.dumps(out, ensure_ascii=False, indent=indent))
+        return
+
+    doc_id = _resolve_doc_id(args)
+    if not doc_id:
+        sys.exit("[ERR] list_chunks 需要 --doc-ids 或 --chunk-ids")
+
+    all_chunks, doc_meta, total = _fetch_doc_chunks_all(tok, doc_id, insecure=insecure)
+    doc_name = (doc_meta or {}).get("name") or doc_id
+    if not all_chunks:
+        out = {
+            "metadata": {
+                "status": "no_result",
+                "action": "list_chunks",
+                "doc_id": doc_id,
+                "doc_name": doc_name,
+                "offset": offset,
+                "has_more": False,
+                "next_offset": None,
+                "total_chunks": 0,
+                "items": [],
+                "via": "native:/v1/chunk/list",
+            },
+            "content": {"items": []},
+            "compressible": True,
+            "flush_group": "retrieval",
+        }
+    else:
+        sliced = all_chunks[offset: offset + limit if limit > 0 else None]
+        meta_items, content_items = _chunk_list_items(sliced)
+        next_offset = offset + len(sliced)
+        has_more = next_offset < total
+        out = {
+            "metadata": {
+                "status": "success",
+                "action": "list_chunks",
+                "doc_id": doc_id,
+                "doc_name": doc_name,
+                "offset": offset,
+                "has_more": has_more,
+                "next_offset": next_offset if has_more else None,
+                "total_chunks": total,
+                "returned_chunks": len(meta_items),
+                "remaining_chunks": max(0, total - next_offset),
+                "items": meta_items,
+                "via": "native:/v1/chunk/list",
+            },
+            "content": {"items": content_items},
+            "compressible": True,
+            "flush_group": "retrieval",
+        }
+        if has_more:
+            out["budget_hint"] = (
+                f"续读: list_chunks --doc-ids {doc_id} --offset {next_offset}"
+                + (f" --limit {limit}" if limit > 0 else "")
+            )
+    indent = None if args.raw else 2
+    print(json.dumps(out, ensure_ascii=False, indent=indent))
+
+
+def do_get_chunk(args, tok: dict) -> None:
+    """取单条 chunk 全文（去掉向量字段）。"""
+    if not args.chunk_id:
+        sys.exit("[ERR] get_chunk 需要 --chunk-id")
+    data = _api_json(
+        "GET", "/v1/chunk/get", tok,
+        params={"chunk_id": args.chunk_id},
+        insecure=args.insecure,
+    )
+    out = {"ok": True, "action": "get_chunk", "chunk_id": args.chunk_id, "chunk": data}
+    indent = None if args.raw else 2
+    print(json.dumps(out, ensure_ascii=False, indent=indent))
+
+
+def do_patch_chunk(args, tok: dict) -> None:
+    """更新 KB chunk 正文；服务端自动 re-tokenize + re-embed。
+
+    走 /v1/chunk/set，与前端「编辑 chunk」同源。用于本地补全 Excel 超链接等。
+    """
+    if not args.doc_id:
+        sys.exit("[ERR] patch_chunk 需要 --doc-id")
+    if not args.chunk_id:
+        sys.exit("[ERR] patch_chunk 需要 --chunk-id")
+    content = _read_content_arg(args)
+    _api_json(
+        "POST", "/v1/chunk/set", tok,
+        json_body={
+            "doc_id": args.doc_id,
+            "chunk_id": args.chunk_id,
+            "content_with_weight": content,
+        },
+        insecure=args.insecure,
+    )
+    out = {
+        "ok": True,
+        "action": "patch_chunk",
+        "doc_id": args.doc_id,
+        "chunk_id": args.chunk_id,
+        "content_chars": len(content),
+        "re_embedded": True,
+        "hint": "用 search --source document --query '<URL关键词>' 验证检索",
+    }
+    indent = None if args.raw else 2
+    print(json.dumps(out, ensure_ascii=False, indent=indent))
+
+
+def do_create_chunk(args, tok: dict) -> None:
+    """为 KB 文档新增一条 chunk；服务端 embed 并 increment_chunk_num。"""
+    if not args.doc_id:
+        sys.exit("[ERR] create_chunk 需要 --doc-id")
+    content = _read_content_arg(args)
+    data = _api_json(
+        "POST", "/v1/chunk/create", tok,
+        json_body={"doc_id": args.doc_id, "content_with_weight": content},
+        insecure=args.insecure,
+    )
+    out = {
+        "ok": True,
+        "action": "create_chunk",
+        "doc_id": args.doc_id,
+        "chunk_id": data.get("chunk_id") if isinstance(data, dict) else data,
+        "content_chars": len(content),
+        "re_embedded": True,
+    }
+    indent = None if args.raw else 2
+    print(json.dumps(out, ensure_ascii=False, indent=indent))
+
+
+def do_delete_chunks(args, tok: dict) -> None:
+    """删除 KB 文档下指定 chunk（整 doc 重建前清空用）。
+
+    走 /v1/chunk/rm。⚠️ 云端 document/run 重新解析也会删 chunk，与 patch 互斥。
+    """
+    if not args.doc_id:
+        sys.exit("[ERR] delete_chunks 需要 --doc-id")
+    if not args.chunk_ids:
+        sys.exit("[ERR] delete_chunks 需要 --chunk-ids（逗号分隔）")
+    ids = [x.strip() for x in str(args.chunk_ids).split(",") if x.strip()]
+    if not ids:
+        sys.exit("[ERR] delete_chunks: --chunk-ids 为空")
+    _api_json(
+        "POST", "/v1/chunk/rm", tok,
+        json_body={"doc_id": args.doc_id, "chunk_ids": ids},
+        insecure=args.insecure,
+    )
+    out = {
+        "ok": True,
+        "action": "delete_chunks",
+        "doc_id": args.doc_id,
+        "deleted": ids,
+        "count": len(ids),
+    }
+    indent = None if args.raw else 2
+    print(json.dumps(out, ensure_ascii=False, indent=indent))
 
 
 def do_kb_list(args, tok: dict) -> None:
@@ -314,6 +767,180 @@ def do_kb_detail(args, tok: dict) -> None:
 
     indent = None if args.raw else 2
     print(json.dumps(data.get("data"), ensure_ascii=False, indent=indent))
+
+
+def _split_csv_ids(raw) -> list:
+    if not raw:
+        return []
+    return [x.strip() for x in str(raw).split(",") if x.strip()]
+
+
+def _fetch_visible_kb_ids(tok: dict, keywords: str = "", insecure: bool = False) -> list:
+    """与 list_kbs 同源：用户可见的全部 KB id（含 team 共享）。"""
+    qs = {"keywords": keywords} if keywords else {}
+    data = _api_json(
+        "POST", "/v1/kb/list", tok,
+        params=qs, json_body={"owner_ids": []}, insecure=insecure,
+    )
+    kbs = data.get("kbs") if isinstance(data, dict) else data
+    if not isinstance(kbs, list):
+        return []
+    return [k["id"] for k in kbs if k.get("id")]
+
+
+def _kb_ids_for_action(args, tok: dict) -> list:
+    ids = _split_csv_ids(getattr(args, "kb_ids", None) or getattr(args, "kb_id", None))
+    if ids:
+        return ids
+    kw = (getattr(args, "keywords", None) or getattr(args, "query", None) or "").strip()
+    return _fetch_visible_kb_ids(tok, keywords=kw, insecure=getattr(args, "insecure", False))
+
+
+def do_list_documents_native(args, tok: dict) -> None:
+    """列 KB 文档 — /v1/document/list，与前端 KB 页同源（不经 graft MemoryOS）。"""
+    kb_ids = _kb_ids_for_action(args, tok)
+    if not kb_ids:
+        sys.exit("[ERR] list_documents: 无可见 KB。先 list_kbs 或加 --kb-ids")
+
+    page = max(1, int(args.page or 1))
+    page_size = min(100, max(1, int(args.page_size or 100)))
+    keywords = (args.query or args.keywords or "").strip()
+
+    all_items = []
+    grand_total = 0
+    for kb_id in kb_ids:
+        params = {
+            "kb_id": kb_id,
+            "page": page,
+            "page_size": page_size,
+            "orderby": args.orderby or "create_time",
+            "desc": "true",
+        }
+        if keywords:
+            params["keywords"] = keywords
+        payload = _api_json(
+            "POST", "/v1/document/list", tok,
+            params=params, json_body={}, insecure=args.insecure,
+        )
+        total = int(payload.get("total") or 0)
+        grand_total += total
+        for d in payload.get("docs") or []:
+            all_items.append({
+                "doc_id": d.get("id"),
+                "doc_name": d.get("name"),
+                "kb_id": kb_id,
+                "chunks": d.get("chunk_num", 0),
+                "run": d.get("run"),
+            })
+
+    out = {
+        "metadata": {
+            "action": "list_documents",
+            "status": "success" if all_items else "no_result",
+            "total": grand_total,
+            "returned": len(all_items),
+            "items": all_items,
+            "via": "native:/v1/document/list",
+        },
+    }
+    indent = None if args.raw else 2
+    print(json.dumps(out, ensure_ascii=False, indent=indent))
+
+
+def _search_items_from_chunks(chunks: list) -> list:
+    return [{
+        "chunk_id": c.get("chunk_id") or c.get("id"),
+        "doc_id": c.get("doc_id"),
+        "doc_name": c.get("docnm_kwd"),
+        "content": c.get("content_with_weight") or c.get("content") or "",
+    } for c in chunks]
+
+
+def do_search_document_native(args, tok: dict) -> None:
+    """KB 文档检索。默认混合语义；--exact 走精确检索（全文，正文子串必含）。"""
+    query = (args.query or "").strip()
+    if not query:
+        sys.exit("[ERR] search 需要 --query")
+
+    kb_ids = _kb_ids_for_action(args, tok)
+    if not kb_ids:
+        sys.exit("[ERR] search: 无可见 KB。加 --kb-ids 或先 list_kbs")
+
+    exact = bool(getattr(args, "exact", False))
+    doc_ids = _split_csv_ids(getattr(args, "doc_ids", None))
+    # 精确检索多召回候选再子串过滤，混合检索按 top_k
+    top_k = max(30, int(args.top_k or 5)) if exact else max(1, min(int(args.top_k or 5), 50))
+
+    body = {
+        "kb_id": kb_ids if len(kb_ids) > 1 else kb_ids[0],
+        "question": query,
+        "top_k": top_k,
+        "page": 1,
+        "size": top_k,
+        "highlight": True,
+    }
+    if doc_ids:
+        body["doc_ids"] = doc_ids
+    if exact:
+        # 关掉向量权重，纯全文；子串过滤在下面做
+        body["vector_similarity_weight"] = 0.0
+        body["similarity_threshold"] = 0.0
+
+    payload = _api_json(
+        "POST", "/v1/chunk/retrieval_test", tok,
+        json_body=body, insecure=args.insecure,
+    )
+    chunks = payload.get("chunks") or []
+
+    if exact:
+        # 精确 = 正文真的包含 query（大小写、空白不敏感），像 WHERE content LIKE '%q%'
+        def _norm(s: str) -> str:
+            return re.sub(r"\s+", "", (s or "")).lower()
+        qn = _norm(query)
+        chunks = [c for c in chunks if qn in _norm(c.get("content_with_weight"))]
+
+    items = _search_items_from_chunks(chunks)
+    out = {
+        "metadata": {
+            "action": "search",
+            "source": "document",
+            "mode": "exact" if exact else "hybrid",
+            "status": "success" if items else "no_result",
+            "total": len(items),
+            "items": items,
+            "kb_ids": kb_ids,
+            "doc_ids": doc_ids or None,
+        },
+        "content": "\n\n---\n\n".join((it.get("content") or "")[:2000] for it in items),
+    }
+    if exact and not items:
+        out["metadata"]["diagnosis_hint"] = (
+            "精确检索 0 命中：若原文件里确实有该字符串，多半是 parse 没把它写进 chunk 正文"
+            "（表格/扫描页/图片常见）。验收：download_document + 本地 grep；修复：patch_chunk 或重跑 parse。"
+        )
+    elif not exact and not items:
+        out["metadata"]["hint"] = "精确/字面量查找请加 --exact；建议配 --doc-ids 缩小范围"
+    indent = None if args.raw else 2
+    print(json.dumps(out, ensure_ascii=False, indent=indent))
+
+
+def _should_use_native_kb_search(args) -> bool:
+    src = (getattr(args, "source", None) or "").strip().lower()
+    if src in ("round", "memory", "channel_history", "episode", "workspace"):
+        return False
+    if getattr(args, "session_id", None):
+        return False
+    return True
+
+
+def _should_use_native_kb_list_chunks(args) -> bool:
+    """KB 文档读 chunk 走原生 API；workspace / session 内 ws_ 文档仍走 graft。"""
+    if getattr(args, "session_id", None):
+        return False
+    doc_id = _resolve_doc_id(args)
+    if doc_id and str(doc_id).startswith("ws_"):
+        return False
+    return True
 
 
 _UUID32_RE = __import__("re").compile(r"^[0-9a-fA-F]{32}$")
@@ -429,15 +1056,111 @@ def do_dispatch(args, tok: dict) -> None:
     print(json.dumps(out, ensure_ascii=False, indent=indent))
 
 
+def do_memories(args, tok: dict) -> None:
+    """扫「我的记忆」+ 能读的「团队记忆」，guardian 格式。不写云端。"""
+    payload = _api_json(
+        "POST", "/v1/graft/memory/prologue", tok,
+        json_body={"query": args.query or ""},
+        insecure=args.insecure,
+    ) or {}
+    indent = None if args.raw else 2
+    print(json.dumps(payload, ensure_ascii=False, indent=indent))
+
+
+def do_team_memory(args, tok: dict) -> None:
+    """把一条个人记忆提交到团队候选池 / 列团队 / 撤回。"""
+    op = (getattr(args, "op", None) or "").strip()
+    if op not in ("teams", "share", "revoke"):
+        sys.exit("[ERR] team_memory 需要 --op teams|share|revoke")
+    if op in ("share", "revoke") and not (getattr(args, "memory", None) or "").strip():
+        sys.exit("[ERR] team_memory --op share/revoke 需要 --memory（记忆 id 或原话）")
+    payload = _api_json(
+        "POST", "/v1/graft/memory/team_memory", tok,
+        json_body={
+            "action": op,
+            "memory": getattr(args, "memory", None) or "",
+            "team": getattr(args, "team", None) or "",
+            "memory_type": getattr(args, "memory_type", None) or "",
+        },
+        insecure=args.insecure,
+    ) or {}
+    indent = None if args.raw else 2
+    print(json.dumps(payload, ensure_ascii=False, indent=indent))
+
+
+_CURATE_OPS = ("pending", "list", "approve", "reject", "demote", "merge", "rewrite", "policy")
+_CURATE_NEED_MEMORY = ("approve", "reject", "demote", "merge", "rewrite")
+
+
+def do_team_curate(args, tok: dict) -> None:
+    """团队所有者策展自己团队的记忆库：看候选池 / 批准 / 拒绝 / 下架 / 合并 / 改写 / 策略。
+    只有团队所有者能调，成员会被服务端拒。"""
+    op = (getattr(args, "op", None) or "").strip()
+    if op not in _CURATE_OPS:
+        sys.exit(f"[ERR] team_curate 需要 --op {'|'.join(_CURATE_OPS)}")
+    memory = (getattr(args, "memory", None) or "").strip()
+    into = (getattr(args, "into", None) or "").strip()
+    has_content = getattr(args, "content", None) is not None or getattr(args, "content_file", None)
+    # rewrite 必须给正文；policy 不给正文 = 只读当前策略
+    content = _read_content_arg(args).strip() if (op == "rewrite" or (op == "policy" and has_content)) else ""
+    if op in _CURATE_NEED_MEMORY and not memory:
+        sys.exit(f"[ERR] team_curate --op {op} 需要 --memory（条目 id 或原话）")
+    if op == "merge" and not into:
+        sys.exit("[ERR] team_curate --op merge 需要 --into（保留哪一条）")
+    if op == "rewrite" and not content:
+        sys.exit("[ERR] team_curate --op rewrite 需要 --content / --content-file（改成什么）")
+    body = {"action": op, "memory": memory, "into": into, "content": content}
+    if getattr(args, "limit", None):
+        body["limit"] = int(args.limit)
+    payload = _api_json(
+        "POST", "/v1/graft/memory/team_curate", tok, json_body=body, insecure=args.insecure,
+    ) or {}
+    indent = None if args.raw else 2
+    print(json.dumps(payload, ensure_ascii=False, indent=indent))
+
+
+def do_record(args, tok: dict) -> None:
+    """用户决定记住的一句话 → 写入云端「我的记忆」。不扫本地文件。"""
+    memory = (getattr(args, "memory", None) or "").strip()
+    if not memory:
+        sys.exit("[ERR] record 需要 --memory（要记住的原话）")
+    payload = _api_json(
+        "POST", "/v1/graft/memory/record", tok,
+        json_body={
+            "memory": memory,
+            "memory_type": (getattr(args, "memory_type", None) or "fact").strip() or "fact",
+        },
+        insecure=args.insecure,
+    ) or {}
+    indent = None if args.raw else 2
+    print(json.dumps(payload, ensure_ascii=False, indent=indent))
+
+
 _DISPATCH_ONLY_FIELDS = frozenset({"prompt"})  # 只在 dispatch_task 里有意义
 _KB_ONLY_FIELDS = frozenset({"kb_id", "keywords", "page", "page_size", "orderby"})
+_CHUNK_API_FIELDS = frozenset({"chunk_id", "doc_id"})  # chunk API / download_document，不进 unified_search
+
+# 显式放行的写动作（裸 create/rm/save 等仍拒绝；带后缀的具体动作在此登记）
+_WRITE_ACTIONS = frozenset({
+    "dispatch_task",
+    "upload",
+    "upload_document",
+    "install_skill",
+    "create_session",
+    "patch_chunk",
+    "create_chunk",
+    "delete_chunks",
+    "team_memory",
+    "team_curate",
+    "record",
+})
 
 
 def do_unified(args, tok: dict) -> None:
     body: dict = {"action": args.action}
     for field in _ARG_ALIAS:
         # 防止把 dispatch / kb_detail 专属字段误透传到 unified_search
-        if field in _DISPATCH_ONLY_FIELDS or field in _KB_ONLY_FIELDS:
+        if field in _DISPATCH_ONLY_FIELDS or field in _KB_ONLY_FIELDS or field in _CHUNK_API_FIELDS:
             continue
         v = getattr(args, field, None)
         if v is None:
@@ -679,7 +1402,77 @@ def do_upload(args, tok: dict) -> None:
 _SKILL_SKIP_DIRS = frozenset({
     ".git", "__pycache__", "node_modules", ".venv", "venv",
     ".pytest_cache", ".mypy_cache", ".idea", ".vscode",
+    "tmp",  # 与仓库 .gitignore 的 tmp/ 一致：本地 code-exec 落盘，不是技能内容
 })
+
+# Windows 编辑器的「UTF-8 with BOM」会在文件头塞 \ufeff。SKILL.md 带 BOM 时
+# 服务端 front-matter 正则（锚在第 0 字节）直接 miss，技能元数据退化成
+# description="\ufeff---"，整段 front-matter 还会漏进正文注入给模型。
+# 上传前按扩展名剥掉，脏字节永远进不了技能库。二进制（assets 里的图/表）不碰。
+_BOM = b"\xef\xbb\xbf"
+_BOM_STRIP_SUFFIXES = frozenset({
+    ".md", ".py", ".json", ".txt", ".yaml", ".yml", ".sh", ".csv", ".toml", ".cfg",
+})
+
+# 技能根目录在两个执行引擎里不是同一个绝对路径（Full: materialize_skill() 的返回值，
+# Fast/CC: /workspace/.claude/skills/<name>/），当前目录两边都不是技能目录。CC 原生会把
+# 技能正文里的 ${CLAUDE_SKILL_DIR} 就地展开成真实绝对路径，所以它是唯一一份两个引擎都能
+# 认的写法 —— 上传前把跑不起来的路径改写成它。
+_SKILL_DIR_VAR = "${CLAUDE_SKILL_DIR}"
+_ABS_WORKSPACE_RE = re.compile(r"/workspace/([\w.-]+|\.\.\.)(/[\w./<>-]*)?")
+# /workspace 下真实存在的顶层目录：会话产物两个引擎都有，写绝对路径是对的；``...`` 是文档占位。
+# 其余顶层目录一律不存在 —— 多半是作者拿技能名或某个子目录当了 /workspace 的一级。
+_REAL_WORKSPACE_DIRS = frozenset({"sessions", "outputs", "inputs", "..."})
+
+
+def _fix_skill_paths(skill_md: str, rel_paths: list) -> tuple:
+    """按 bundle 的文件清单校正 SKILL.md 里换个引擎就读不到的路径。
+
+    1. 指向技能目录的 ``/workspace/...`` 绝对路径 **自动改写**成
+       ``${CLAUDE_SKILL_DIR}/<相对路径>``（按最长后缀匹配包里的文件/目录）。这类无歧义：
+       那个绝对路径在另一个引擎里根本不存在，包里又只有一个位置对得上。
+    2. 裸文件名（包里在子目录下、正文别处也没给出相对路径）**只提醒不改**。同一个裸名
+       可能是要执行的命令参数，也可能是目录树示意图里的一格、或泛指某类文件
+       （``改 theme.yaml 里的 colors`` 说的是复制出来的那份，不是包里那份），
+       这些改了就是错的，而区分只有作者做得到。
+
+    只动上传副本，本地文件不变。返回 ``(新正文, 改写记录, 只能提醒的问题)``。
+    """
+    known = set(rel_paths) | {p.rsplit("/", 1)[0] for p in rel_paths if "/" in p}
+    by_base = {}
+    for p in rel_paths:
+        by_base.setdefault(p.rsplit("/", 1)[-1], []).append(p)
+
+    fixes, warns = [], []
+
+    def _rewrite_abs(m):
+        if m.group(1) in _REAL_WORKSPACE_DIRS:
+            return m.group(0)  # 会话目录 / 文档占位，绝对路径是对的
+        segs = m.group(0)[len("/workspace/"):].strip("/").split("/")
+        for i in range(len(segs)):  # 最长后缀优先：剥掉 builtin-skills/<name> 这类前缀
+            cand = "/".join(segs[i:])
+            if cand in known:
+                fixes.append(f"{m.group(0)} → {_SKILL_DIR_VAR}/{cand}")
+                return f"{_SKILL_DIR_VAR}/{cand}"
+        warns.append(f"绝对路径 {m.group(0)}：包里没有对应文件，改不了，请自己确认")
+        return m.group(0)
+
+    body = _ABS_WORKSPACE_RE.sub(_rewrite_abs, skill_md)
+
+    for base, hits in sorted(by_base.items()):
+        if not any("/" in h for h in hits):
+            continue  # 文件就在技能根目录，裸名引用本来就对
+        if "." not in base:
+            continue  # 没扩展名的多半是普通英文词（dist/browse、bin/gstack-config）
+        if any(h in body for h in hits):
+            continue  # 正文别处给了完整相对路径，模型找得到
+        # 裸名：前面不能连着路径分隔符或别的标识符，否则是 scripts/x.py 里的那一段
+        if not re.search(rf"(?<![\w/.\-]){re.escape(base)}(?![\w-])", body):
+            continue
+        want = f"{_SKILL_DIR_VAR}/{hits[0]}" if len(hits) == 1 else "/".join(("…",) + tuple(hits))
+        warns.append(f"裸文件名 {base}：正文没给出目录，模型读不到 → 命令里请写 {want}")
+
+    return body, list(dict.fromkeys(fixes)), list(dict.fromkeys(warns))
 
 
 def do_install_skill(args, tok: dict) -> None:
@@ -703,23 +1496,43 @@ def do_install_skill(args, tok: dict) -> None:
         sys.exit(f"[ERR] {skill_dir} 下找不到 SKILL.md（skill 目录必须含 SKILL.md）")
 
     top = skill_dir.name  # 顶层目录名，后端按它做 dir-name invariant 校验
-    buf = io.BytesIO()
-    packed = []
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for root, dirs, files in os.walk(skill_dir):
-            dirs[:] = [
-                d for d in dirs
-                if d not in _SKILL_SKIP_DIRS and not d.startswith(".")
-            ]
-            for fn in sorted(files):
-                if fn.startswith("."):  # .DS_Store / .gitignore 之类
-                    continue
-                fp = Path(root) / fn
-                rel = fp.relative_to(skill_dir).as_posix()
-                zf.write(fp, arcname=f"{top}/{rel}")
-                packed.append(rel)
-    if "SKILL.md" not in packed:
+    contents = {}  # rel → bytes，先全收齐：路径改写要拿整份文件清单当依据
+    debommed = []
+    for root, dirs, files in os.walk(skill_dir):
+        dirs[:] = [
+            d for d in dirs
+            if d not in _SKILL_SKIP_DIRS and not d.startswith(".")
+        ]
+        for fn in sorted(files):
+            if fn.startswith("."):  # .DS_Store / .gitignore 之类
+                continue
+            fp = Path(root) / fn
+            rel = fp.relative_to(skill_dir).as_posix()
+            data = fp.read_bytes()
+            if data.startswith(_BOM) and fp.suffix.lower() in _BOM_STRIP_SUFFIXES:
+                data = data[len(_BOM):]
+                debommed.append(rel)
+            contents[rel] = data
+    if "SKILL.md" not in contents:
         sys.exit("[ERR] 打包后竟无 SKILL.md，请检查目录")
+    if debommed:
+        print(f"[i] 已剥掉 UTF-8 BOM（上传副本，本地文件不变）: {', '.join(debommed)}")
+
+    fixed, fixes, warns = _fix_skill_paths(
+        contents["SKILL.md"].decode("utf-8", "replace"), sorted(contents),
+    )
+    if fixes:
+        contents["SKILL.md"] = fixed.encode("utf-8")
+        print("[i] SKILL.md 路径已改写为 ${CLAUDE_SKILL_DIR}（上传副本，本地文件不变）:")
+        for fix in fixes:
+            print(f"    {fix}")
+    for warn in warns:
+        print(f"[!] 可移植性: {warn}")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for rel, data in contents.items():
+            zf.writestr(f"{top}/{rel}", data)
     zip_bytes = buf.getvalue()
     if len(zip_bytes) > _MAX_UPLOAD:
         sys.exit(f"[ERR] 打包体积过大 {len(zip_bytes)} bytes > {_MAX_UPLOAD}")
@@ -766,8 +1579,8 @@ def do_install_skill(args, tok: dict) -> None:
     out = {
         "ok": True,
         "skill_name": data.get("skill_name", top),
-        "file_count": data.get("file_count", len(packed)),
-        "packed_files": sorted(packed),
+        "file_count": data.get("file_count", len(contents)),
+        "packed_files": sorted(contents),
         "hint": (
             "已装入个人技能库（skills/users/<你>/）。"
             "在 ComboAgent 会话或前端「技能设置」即可见。"
@@ -958,6 +1771,65 @@ def do_create_session(args, tok: dict) -> None:
     print(json.dumps(out, ensure_ascii=False, indent=indent))
 
 
+def do_wire_script_tools(args, tok: dict) -> None:
+    """把一个已装的（无 manifest）skill 的脚本接成动态工具（skill-only，零核心改动）。
+
+    原理：**不新增任何后端端点、不改平台核心**。本动作只是把一段"接线"指令通过
+    现成的 dispatch_task 派给一个已有 combo 会话，由云端 agent 在会话里用它自带的
+    自编程能力（`write_file` 写 `users/<uid>/scripts/<tool>/main.py` + 登记
+    `registry.json`，即 assistant 提示词 §SCRIPT TOOL REGISTRATION 的"方式二"）
+    把脚本注册成持久工具。下一会话 basic_team 的 `load_all → create_dynamic_tools`
+    自动把它们放进工具池。
+
+    所以它**不是第五个写端点**——底层就是 dispatch_task（已放行的写动作），不建/
+    删资源。兜底：即使接线失败，skill 仍以纯 markdown 形式可用（agent 读 SKILL.md +
+    execute_code 跑脚本），只是没升级成动态工具。
+
+    要等结果用 `get_digest --session-id <target>` 轮询；**工具在下一个会话才生效**。
+    """
+    if not args.skill_name:
+        sys.exit("[ERR] wire_script_tools 需要 --skill-name（已装入个人库的 skill 名）")
+    if not args.session_id:
+        sys.exit("[ERR] wire_script_tools 需要 --session-id（派发接线任务的目标会话名/UUID）")
+
+    # 接线提示词模板与本脚本同属一个 skill：scripts/call.py → ../references/
+    tmpl_path = (
+        Path(__file__).resolve().parent.parent / "references" / "wire-script-tools.md"
+    )
+    try:
+        template = tmpl_path.read_text(encoding="utf-8")
+    except OSError as e:
+        sys.exit(f"[ERR] 读取接线模板失败 {tmpl_path}: {e}")
+
+    prompt = template.replace("{{SKILL_NAME}}", args.skill_name)
+    extra = (args.prompt or "").strip()
+    if extra:
+        prompt += f"\n\n## 额外要求（调用方追加）\n{extra}\n"
+
+    target_uuid = _resolve_session_id(args.session_id, tok, insecure=args.insecure)
+    if target_uuid != args.session_id:
+        print(f"[INFO] resolved '{args.session_id}' → {target_uuid}", file=sys.stderr)
+
+    payload = _dispatch_to_session(
+        target_uuid, prompt, tok, insecure=args.insecure
+    )
+    out = {
+        "ok": True,
+        "queued": True,
+        "skill_name": args.skill_name,
+        "target_session_id": payload.get("target_session_id"),
+        "agent_id": payload.get("agent_id"),
+        "queued_at_ms": payload.get("queued_at_ms"),
+        "hint": (
+            "接线任务已派发（底层 = dispatch_task）。用 "
+            "get_digest --session-id <target_session_id> 看 agent 接线结果；"
+            "注册的工具在【下一个会话】才会被加载进工具池。"
+        ),
+    }
+    indent = None if args.raw else 2
+    print(json.dumps(out, ensure_ascii=False, indent=indent))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="graft-comboagent 调用入口",
@@ -968,15 +1840,22 @@ def main() -> None:
         help="list_sessions | get_digest | get_round | search | "
              "search_by_artifact | read_file | list_files | grep_file | "
              "list_documents | get_doc_profile | list_chunks | download | "
+             "download_document | list_doc_chunks | get_chunk | "
+             "patch_chunk | create_chunk | delete_chunks | "
              "list_kbs | kb_detail | list_agents | create_session | "
-             "dispatch_task | upload | install_skill",
+             "dispatch_task | upload | install_skill | wire_script_tools | "
+             "memories | record | team_memory | team_curate",
     )
     for field, flags in _ARG_ALIAS.items():
         ap.add_argument(*flags, dest=field, default=None)
     ap.add_argument("--filename", default=None,
                     help="download: HTTP 附件名；默认 path basename")
     ap.add_argument("--out", default=None,
-                    help="download: 本地落盘路径；默认 .graft/downloads/<basename>")
+                    help="download / download_document: 本地落盘路径")
+    ap.add_argument("--content", default=None,
+                    help="patch_chunk / create_chunk: 新正文（与 --content-file 二选一）")
+    ap.add_argument("--content-file", dest="content_file", default=None,
+                    help="patch_chunk / create_chunk: 从文件读正文")
     # ── upload 专属（不进 _ARG_ALIAS，不会透传给 unified_search）──
     ap.add_argument("--file", action="append", default=None,
                     help="upload: 本地文件路径，可多次（也支持逗号分隔）")
@@ -1003,6 +1882,9 @@ def main() -> None:
                     help="install_skill: 同名技能已存在时覆盖（默认拒绝）")
     ap.add_argument("--allow-shadow", dest="allow_shadow", action="store_true",
                     help="install_skill: 允许覆盖 builtin 同名 tool（罕见，谨慎）")
+    # ── wire_script_tools 专属 ──
+    ap.add_argument("--skill-name", dest="skill_name", default=None,
+                    help="wire_script_tools: 已装入个人库、要把脚本接成动态工具的 skill 名")
     # ── list_agents / create_session 专属 ──
     ap.add_argument("--agent-id", dest="agent_id", default=None,
                     help="create_session: 目标 agent 名称或 UUID（先用 list_agents 查）")
@@ -1012,8 +1894,21 @@ def main() -> None:
                     help="create_session: 建好会话后立即派发的首条指令（一步建并驱动）")
     ap.add_argument("--allow-duplicate", dest="allow_duplicate", action="store_true",
                     help="create_session: 强制新建（默认复用该 agent 已有 session）")
+    ap.add_argument("--op", dest="op", default=None,
+                    help="team_memory: teams / share / revoke；"
+                         "team_curate: pending / list / approve / reject / demote / merge / rewrite / policy")
+    ap.add_argument("--memory", dest="memory", default=None,
+                    help="record: 要记住的原话；team_memory / team_curate: 记忆 id 或原话")
+    ap.add_argument("--team", dest="team", default=None,
+                    help="team_memory share: 团队名或 tenant_id；只在一个团队里可不填")
+    ap.add_argument("--into", dest="into", default=None,
+                    help="team_curate merge: 保留哪一条（id 或原话）")
+    ap.add_argument("--memory-type", dest="memory_type", default=None,
+                    help="record / team_memory: fact / preference / program / error_pattern（record 默认 fact）")
     ap.add_argument("--raw", action="store_true",
                     help="JSON 输出不 pretty-print")
+    ap.add_argument("--exact", action="store_true",
+                    help="search: 精确检索（全文关向量 + 正文子串必含），用于 ID/编号/原文短语")
     ap.add_argument("--insecure", action="store_true",
                     help="忽略 TLS 校验（仅调试）")
     args = ap.parse_args()
@@ -1022,27 +1917,40 @@ def main() -> None:
     if not tok.get("server") or not tok.get("auth_token"):
         sys.exit(f"[ERR] token 文件字段不完整: {TOKEN_PATH}")
 
-    # ⚠️ 显式拒绝任何写/删类动作，即使 token 技术上能调那些端点。
-    # 这是 skill 层的产品策略，与服务端白名单无关。
-    # 放行的写动作：dispatch_task（向已有 session 排队执行）、upload（灌文件进 KB）、
-    # install_skill（装技能进个人库）、create_session（为 agent 新建会话）。
-    # 其余 rm/save/update/delete… 一律拒（注意 "create" 仍禁，create_session
-    # 是显式放行的具体动作，与裸 "create" 不同）。
+    # ⚠️ 写边界：仅 _WRITE_ACTIONS 里列出的动作可写 KB / session / 技能库。
+    # 裸 create/rm/save/update 等仍拒绝（create_session / create_chunk 等
+    # 带具体后缀的动作在 _WRITE_ACTIONS 白名单里）。
     _BANNED_ACTIONS = frozenset({
         "rm", "delete", "remove", "save", "create", "update", "patch", "put",
         "copy_kb_document", "register_artifact",
     })
-    if args.action in _BANNED_ACTIONS or any(
+    if args.action in _BANNED_ACTIONS and args.action not in _WRITE_ACTIONS:
+        sys.exit(
+            f"[ERR] 拒绝执行写操作 '{args.action}'。"
+            f"graft 写口: {', '.join(sorted(_WRITE_ACTIONS))}"
+        )
+    if args.action not in _WRITE_ACTIONS and any(
         args.action.startswith(p) for p in ("rm_", "delete_", "remove_")
     ):
         sys.exit(
             f"[ERR] 拒绝执行写操作 '{args.action}'。"
-            "graft-comboagent 只放行 dispatch_task / upload 两个写动作；"
-            "其余写/删请走前端 UI。"
+            f"graft 写口: {', '.join(sorted(_WRITE_ACTIONS))}"
         )
 
     if args.action == "download":
         do_download(args, tok)
+    elif args.action == "download_document":
+        do_download_document(args, tok)
+    elif args.action == "list_doc_chunks":
+        do_list_doc_chunks(args, tok)
+    elif args.action == "get_chunk":
+        do_get_chunk(args, tok)
+    elif args.action == "patch_chunk":
+        do_patch_chunk(args, tok)
+    elif args.action == "create_chunk":
+        do_create_chunk(args, tok)
+    elif args.action == "delete_chunks":
+        do_delete_chunks(args, tok)
     elif args.action == "list_kbs":
         do_kb_list(args, tok)
     elif args.action == "kb_detail":
@@ -1057,6 +1965,22 @@ def main() -> None:
         do_list_agents(args, tok)
     elif args.action == "create_session":
         do_create_session(args, tok)
+    elif args.action == "wire_script_tools":
+        do_wire_script_tools(args, tok)
+    elif args.action == "memories":
+        do_memories(args, tok)
+    elif args.action == "record":
+        do_record(args, tok)
+    elif args.action == "team_memory":
+        do_team_memory(args, tok)
+    elif args.action == "team_curate":
+        do_team_curate(args, tok)
+    elif args.action == "list_documents":
+        do_list_documents_native(args, tok)
+    elif args.action == "search" and _should_use_native_kb_search(args):
+        do_search_document_native(args, tok)
+    elif args.action == "list_chunks" and _should_use_native_kb_list_chunks(args):
+        do_list_chunks_native(args, tok)
     else:
         do_unified(args, tok)
 

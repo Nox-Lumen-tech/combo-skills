@@ -10,16 +10,40 @@
 
 ## A. 我要查云端知识库（KB）
 
+**检索判定（先看这行）**：用户给的是**已知字符串**（Test Case ID、REQ 编号、信号名、版本号、原文短语）→ `--exact`；给的是**问题描述/找相关内容**→ 默认混合 `search`。
+
 | 意图 | 用 |
 |---|---|
 | 不知道有哪些 KB | `list_kbs` |
 | 想看某个 KB 的元信息（大小、parser、embedding 模型） | `kb_detail --kb-id <id>` |
-| **在 KB 里语义检索**（最高频） | `search --source document --query "..." --kb-ids <id> --top-k 3` |
-| 只在某文档内搜（精准片段，不占满上下文） | `search --source document --query "..." --doc-ids <id>` |
+| **精确检索**（ID/编号/原文短语，正文必含） | `search --source document --query "1023265" --doc-ids <doc> --exact` |
+| **语义检索**（自然语言、找相关） | `search --source document --query "..." --kb-ids <id> --top-k 3` |
+| 只在某文档内语义搜（不占满上下文） | `search --source document --query "..." --doc-ids <id>` |
+| **search 命中后取完整正文**（默认下一步） | `list_chunks --chunk-ids <chunk_id> --window 0` ← id 来自 `metadata.items[].chunk_id` |
 | 列 KB 里所有文档 | `list_documents --kb-ids <id>` |
 | 看文档结构概要（章节 / Sheet / chunk 数） | `get_doc_profile --doc-ids <id>` |
-| **读文档全文**（需翻页） | `list_chunks --doc-ids <id> --offset 0 --limit 20`，下一页 `--offset 20` |
-| **search 命中后看前后上下文** | `list_chunks --chunk-ids <hit_id> --window 2` ← 返回目标 chunk + 前后各 2 个同文档 chunk |
+| 从文档**开头**顺序读 chunk（**仅小 doc，<~10k chunks**） | `list_chunks --doc-ids <id> --offset 0 --limit 20`；`offset` 是 chunk 游标，**不是 PDF 页码** |
+| search 命中后要邻接上下文（小 doc） | `list_chunks --chunk-ids <hit_id> --window 1` |
+| **下载 KB 原文件**（patch Excel 前） | `download_document --doc-id <id> [--out ./local.xlsx]` |
+| **读 chunk 正文（patch 前）** | `list_doc_chunks --doc-id <id>` ← 含 `content_with_weight` |
+| **用户说 KB 某处内容错了 / Excel 链接丢了** | 见下方 **§I** |
+
+## I. KB chunk 定点修补（不改 parse）
+
+| 意图 | 用 |
+|---|---|
+| 下载 KB 里的原 xlsx/docx | `download_document --doc-id <id>` |
+| 看某 doc 所有 chunk 正文 | `list_doc_chunks --doc-id <id> [--page N]` |
+| 看单条 chunk | `get_chunk --chunk-id <id>` |
+| 本地抽 Excel 单元格 URL | `python scripts/excel_link.py --file <xlsx> --sheet S1 --cell B5` |
+| 把 URL 并进 chunk 文字 | `python scripts/enrich_chunk.py --text "..." --url "https://..."` |
+| **写回 + 云端 re-embed** | `patch_chunk --doc-id <id> --chunk-id <id> --content "..."` |
+| 整 doc 清空后重建（少用） | `delete_chunks` → 多次 `create_chunk` |
+| 验证 patch 生效 | `search --source document --query "<URL>" --doc-ids <id>` |
+
+> ⚠️ **不要**对同一 doc 用 `upload --parse` 或前端 re-parse —— 会覆盖 patch。修链接走 `patch_chunk`，不走 parse。
+
+> 🔍 **检索逻辑 self-awareness**：大文档 / 标准库 / SWTD 等 **禁止** 用 `--doc-ids --offset` 找深页内容；必须 `search` → `--chunk-ids --window 0`。详见 [`kb-retrieval-logic.md`](kb-retrieval-logic.md)。
 
 ## B. 我要嫁接已有 session 的成果
 
@@ -60,6 +84,18 @@
 | 看上传后解析进度 | `list_documents --kb-ids <id>` 看每条 `run` / `progress` |
 
 > ⚠️ 默认**只上传不解析**，要进检索必须加 `--parse`。只能传到你有权限的 KB；不删/不改 KB 既有内容。大批量（几百文件）走前端 KB，不要用本 skill 刷。
+
+## J. 我要记 / 扫 / 提交云端记忆
+
+| 意图 | 用 |
+|---|---|
+| 用户说「记住这个」 | `record --memory "<原话>"`（可选 `--memory-type`） |
+| 把「我的记忆」+ 团队约定拉进当前上下文 | `memories`；有具体问题加 `--query "..."` |
+| 这条个人记忆团队都该知道 | 没有云端原条就先 `record`，再 `team_memory --op share --memory "<原话或 id>"` |
+| 不知道能提交到哪个团队 | `team_memory --op teams`；多个团队先问用户再带 `--team` |
+| 撤回我提交过的 | `team_memory --op revoke --memory "<原话或 id>"` |
+
+用户没说记住就不要 `record`。没说共享就不要 `share`。不要扫本地 `CLAUDE.md`。提交进的是候选池，不是已生效。
 
 ## 跨场景的高频过滤参数
 
