@@ -92,21 +92,21 @@ pip install requests pycryptodome
 ### Cursor
 
 ```bash
-cp -r /home/ubuntu/lu.shi/ragbase/skills/graft-comboagent ~/.cursor/skills/
+cp -r <path-to>/combo-skills/graft-comboagent ~/.cursor/skills/
 # 或（更新时自动同步）：
-ln -s /home/ubuntu/lu.shi/ragbase/skills/graft-comboagent ~/.cursor/skills/graft-comboagent
+ln -s <path-to>/combo-skills/graft-comboagent ~/.cursor/skills/graft-comboagent
 ```
 
 ### Claude Code
 
 ```bash
-cp -r /home/ubuntu/lu.shi/ragbase/skills/graft-comboagent ~/.claude/skills/
+cp -r <path-to>/combo-skills/graft-comboagent ~/.claude/skills/
 ```
 
 ### Codex
 
 ```bash
-cp -r /home/ubuntu/lu.shi/ragbase/skills/graft-comboagent ~/.codex/skills/
+cp -r <path-to>/combo-skills/graft-comboagent ~/.codex/skills/
 ```
 
 装完后重启宿主即可让 skill 被发现。
