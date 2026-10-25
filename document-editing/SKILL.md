@@ -58,7 +58,7 @@ metadata:
 ❌ 错误：read_file 读两个完整 docx → execute_code 逐行对比
    → 两份文档全文进 context，token 爆炸
 
-✅ 正确：对每个需求项分别搜 EEA 和 GAC 的 ws_doc_id
+✅ 正确：对每个需求项分别搜 EEA 和 SYS 的 ws_doc_id
    → 每次只对比两个精确 chunk，在 reasoning 中直接分析差异
 ```
 
@@ -248,13 +248,13 @@ unified_search(query="最后一个期望内容", doc_ids="new_ws_doc_id")
 
 **批量编号**：搜索第一个和最后一个编号，确认序号连续、没有偏移
 ```python
-unified_search(query="GAC_外灯系统_01", doc_ids="ws_{sid}_{hash}")
+unified_search(query="SYS_外灯系统_01", doc_ids="ws_{sid}_{hash}")
 # 期望返回 "前雾灯指示灯" 相关 chunk — 如果返回的是 "后雾灯指示灯"，说明编号偏移了
 ```
 
 **超链接映射**：搜索映射的两端，确认对应关系
 ```python
-unified_search(query="FUNC_0007", doc_ids="ws_{sid}_{hash_gac}")
+unified_search(query="FUNC_0007", doc_ids="ws_{sid}_{hash_sys}")
 # 期望出现在 "前雾灯指示灯" chunk — 如果不是，说明映射错位
 ```
 

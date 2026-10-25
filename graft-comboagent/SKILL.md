@@ -40,10 +40,10 @@ metadata:
 **官方获取入口**：用户在 [`https://xipnex.nox-lumen.com/combospace/user-setting/skills`](https://xipnex.nox-lumen.com/combospace/user-setting/skills) 可以查看/复制属于自己的 combo-agent 访问地址。如果用户没明确说用哪个 server，agent 应先建议他从这里复制。
 
 **用户丢一条完整 signin URL 时，agent 自己拆**：例如
-`https://katrina-simpson-welfare-funeral.trycloudflare.com/zh/signin?email=test-syncore%40nox-lumen.com&password=<password>`
+`https://<tunnel-name>.trycloudflare.com/zh/signin?email=user%40example.com&password=<password>`
 应拆成：
-- `--server https://katrina-simpson-welfare-funeral.trycloudflare.com`（去掉 `/zh/signin` path 和整个 query）
-- `--email test-syncore@nox-lumen.com`（URL-decode：`%40`→`@`、`%20`→空格 等）
+- `--server https://<tunnel-name>.trycloudflare.com`（去掉 `/zh/signin` path 和整个 query）
+- `--email user@example.com`（URL-decode：`%40`→`@`、`%20`→空格 等）
 - `--password <password>`（从 query 原值取，URL-decode 后用）
 
 然后一行直接登录（无需交互）：

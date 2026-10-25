@@ -1,6 +1,6 @@
 # Combo Agent Skills
 
-Skills for [Combo Agent](https://xipnex.nox-lumen.com) — code review, binary document editing, Word/Excel generation, cross-session retrieval from local IDEs, and more.
+Skills for [Combo Agent](https://xipnex.nox-lumen.com) — code review, binary document editing, Excel generation, cross-session retrieval from local IDEs, and more.
 
 See the [docs · Skills](https://xipnex.nox-lumen.com/docs/skills) for the full skill catalog.
 
@@ -11,7 +11,6 @@ See the [docs · Skills](https://xipnex.nox-lumen.com/docs/skills) for the full 
 | Skill | Description |
 |-------|-------------|
 | [document-editing](./document-editing/) | Binary document (DOCX/XLSX/PPTX) incremental editing with Copy-on-Write snapshots |
-| [docx](./docx/) | Create, read, edit, and manipulate Word documents (.docx) with full formatting support |
 | [xlsx](./xlsx/) | Create, read, edit, and manipulate Excel spreadsheets (.xlsx/.xls) |
 
 ### Code review — L2 (semantic, LLM-driven)
@@ -71,7 +70,6 @@ For example:
 /skill-install Nox-Lumen-tech/combo-skills/ruff
 /skill-install Nox-Lumen-tech/combo-skills/checkstyle
 /skill-install Nox-Lumen-tech/combo-skills/clang-tidy
-/skill-install Nox-Lumen-tech/combo-skills/docx
 /skill-install Nox-Lumen-tech/combo-skills/document-editing
 /skill-install Nox-Lumen-tech/combo-skills/xlsx
 ```
