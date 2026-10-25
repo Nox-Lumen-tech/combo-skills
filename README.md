@@ -6,6 +6,12 @@ See the [docs · Skills](https://xipnex.nox-lumen.com/docs/skills) for the full 
 
 ## Skills
 
+### Social media automation
+
+| Skill | Description |
+|-------|-------------|
+| [redbook](./redbook/) | 小红书 (Xiaohongshu/RED) note reading & posting via CDP browser channel + guard risk-control gate (interval/daily-limit/captcha-cooldown), with an upstream CLI fork fix (Chrome 155+ CDP cookies) |
+
 ### Document handling
 
 | Skill | Description |
@@ -74,6 +80,7 @@ For example:
 /skill-install Nox-Lumen-tech/combo-skills/docx
 /skill-install Nox-Lumen-tech/combo-skills/document-editing
 /skill-install Nox-Lumen-tech/combo-skills/xlsx
+/skill-install Nox-Lumen-tech/combo-skills/redbook
 ```
 
 > The full **L1 + L2 review suite** is just 11 `/skill-install` commands away.
